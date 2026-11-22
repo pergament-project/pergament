@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +21,8 @@ pub const MANIFEST: &str = ".pergament-export.json";
 
 const MANIFEST_VERSION: u32 = 1;
 const MAX_NAME_CHARS: usize = 80;
+/// Leaves room for ` N.md` within the 255-byte name limit of common file systems.
+const MAX_NAME_BYTES: usize = 200;
 const FALLBACK_NAME: &str = "Note";
 
 /// What an export did, or would do with `dry_run`.
@@ -110,7 +112,10 @@ fn sanitize(name: &str) -> String {
         .collect();
     let collapsed = kept.split_whitespace().collect::<Vec<_>>().join(" ");
     let trimmed = collapsed.trim_start_matches(['.', ' ']);
-    let cut: String = trimmed.chars().take(MAX_NAME_CHARS).collect();
+    let mut cut: String = trimmed.chars().take(MAX_NAME_CHARS).collect();
+    while cut.len() > MAX_NAME_BYTES {
+        cut.pop();
+    }
     let mut out = cut.trim_end_matches(['.', ' ']).to_string();
     let stem_len = out.find('.').unwrap_or(out.len());
     if is_reserved(&out[..stem_len]) {
@@ -165,22 +170,27 @@ fn read_manifest(folder: &Path) -> Result<BTreeMap<String, String>> {
         .collect())
 }
 
-/// The entries of `folder` by name, `true` for regular files; empty when it is missing.
-fn list_folder(folder: &Path) -> Result<HashMap<String, bool>> {
+/// The names of the entries in `folder`; empty when it is missing.
+fn list_folder(folder: &Path) -> Result<HashSet<String>> {
     let entries = match fs::read_dir(folder) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
         Err(e) => return Err(e.into()),
     };
-    let mut out = HashMap::new();
+    let mut out = HashSet::new();
     for entry in entries {
-        let entry = entry?;
         // Names that aren't UTF-8 can't clash with the names an export writes.
-        if let Ok(name) = entry.file_name().into_string() {
-            out.insert(name, entry.file_type()?.is_file());
+        if let Ok(name) = entry?.file_name().into_string() {
+            out.insert(name);
         }
     }
     Ok(out)
+}
+
+/// Whether `path` is a regular file, not a link or folder; looked up by path so
+/// file systems that normalize names (HFS+) still find it.
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
 
 /// Whether `name` is `{base}.md` or `{base} N.md`, ignoring case.
@@ -205,14 +215,16 @@ pub fn export(folder: &Path, files: Vec<NoteFile>, dry_run: bool) -> Result<Expo
     // Only regular files the manifest names are ours; a link or folder never is.
     let owned: BTreeMap<String, String> = manifest
         .into_iter()
-        .filter(|(name, _)| on_disk.get(name) == Some(&true))
+        .filter(|(name, _)| is_regular_file(&folder.join(name)))
         .collect();
     let owned_lower: HashMap<String, &str> = owned
         .keys()
         .map(|n| (n.to_lowercase(), n.as_str()))
         .collect();
+    // A listed name that is an owned file in another normalization counts as
+    // foreign too, so it is never picked for another note.
     let foreign_lower: HashSet<String> = on_disk
-        .keys()
+        .iter()
         .filter(|n| !owned.contains_key(*n))
         .map(|n| n.to_lowercase())
         .collect();
@@ -240,6 +252,7 @@ pub fn export(folder: &Path, files: Vec<NoteFile>, dry_run: bool) -> Result<Expo
             names[i] = Some(name);
         }
     }
+    let guids: HashSet<&str> = files.iter().map(|f| f.guid.as_str()).collect();
     for (i, base) in bases.iter().enumerate() {
         if names[i].is_some() {
             continue;
@@ -253,8 +266,11 @@ pub fn export(folder: &Path, files: Vec<NoteFile>, dry_run: bool) -> Result<Expo
                 let lower = name.to_lowercase();
                 !taken.contains(&lower)
                     && !foreign_lower.contains(&lower)
-                    // An owned file differing only in case would be removed over it.
-                    && owned_lower.get(&lower).is_none_or(|o| *o == name)
+                    // An owned file differing only in case would be removed over
+                    // it, and a gone note's file is removed, not overwritten.
+                    && owned_lower
+                        .get(&lower)
+                        .is_none_or(|o| *o == name && guids.contains(owned[*o].as_str()))
             })
             .expect("some numbered name is free");
         taken.insert(name.to_lowercase());
@@ -262,7 +278,6 @@ pub fn export(folder: &Path, files: Vec<NoteFile>, dry_run: bool) -> Result<Expo
     }
     let names: Vec<String> = names.into_iter().map(|n| n.expect("assigned")).collect();
 
-    let guids: HashSet<&str> = files.iter().map(|f| f.guid.as_str()).collect();
     let assigned: HashSet<&str> = names.iter().map(String::as_str).collect();
     let mut report = ExportReport {
         notes: files.len(),
@@ -303,9 +318,36 @@ pub fn export(folder: &Path, files: Vec<NoteFile>, dry_run: bool) -> Result<Expo
         return Ok(report);
     }
 
+    let manifest = Manifest {
+        version: MANIFEST_VERSION,
+        files: names
+            .iter()
+            .zip(&files)
+            .map(|(name, file)| (name.clone(), file.guid.clone()))
+            .collect(),
+    };
+    let mut created = Vec::new();
+    let written = write_export(folder, &writes, &removals, &manifest, &mut created);
+    if written.is_err() {
+        // Files left without a manifest would count as foreign next time.
+        for path in &created {
+            let _ = fs::remove_file(path);
+        }
+    }
+    written.map(|()| report)
+}
+
+/// The writing part of [`export`]; every file it creates is added to `created`.
+fn write_export(
+    folder: &Path,
+    writes: &[(&String, bool, &String)],
+    removals: &[&String],
+    manifest: &Manifest,
+    created: &mut Vec<PathBuf>,
+) -> Result<()> {
     fs::create_dir_all(folder)?;
     for (name, exists, contents) in writes {
-        write_file(&folder.join(name), !exists, contents.as_bytes())?;
+        write_file(&folder.join(name), !exists, contents.as_bytes(), created)?;
     }
     for name in removals {
         match fs::remove_file(folder.join(name)) {
@@ -313,26 +355,19 @@ pub fn export(folder: &Path, files: Vec<NoteFile>, dry_run: bool) -> Result<Expo
             _ => {}
         }
     }
-    let manifest = Manifest {
-        version: MANIFEST_VERSION,
-        files: names
-            .into_iter()
-            .zip(files)
-            .map(|(name, file)| (name, file.guid))
-            .collect(),
-    };
     let tmp = folder.join(format!("{MANIFEST}.tmp"));
     match fs::remove_file(&tmp) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
     }
-    write_file(&tmp, true, json(&manifest).as_bytes())?;
+    write_file(&tmp, true, json(manifest).as_bytes(), created)?;
     fs::rename(&tmp, folder.join(MANIFEST))?;
-    Ok(report)
+    Ok(())
 }
 
-/// Writes `contents` to `path`; with `new`, fails rather than follow or replace anything there.
-fn write_file(path: &Path, new: bool, contents: &[u8]) -> Result<()> {
+/// Writes `contents` to `path`; with `new`, fails rather than follow or replace
+/// anything there, and adds the file to `created` once it exists.
+fn write_file(path: &Path, new: bool, contents: &[u8], created: &mut Vec<PathBuf>) -> Result<()> {
     let mut options = OpenOptions::new();
     options.write(true);
     if new {
@@ -340,7 +375,11 @@ fn write_file(path: &Path, new: bool, contents: &[u8]) -> Result<()> {
     } else {
         options.truncate(true);
     }
-    options.open(path)?.write_all(contents)?;
+    let mut file = options.open(path)?;
+    if new {
+        created.push(path.to_owned());
+    }
+    file.write_all(contents)?;
     Ok(())
 }
 

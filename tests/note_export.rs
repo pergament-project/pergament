@@ -254,6 +254,73 @@ fn unsafe_manifest_entries_are_not_reused_as_names() {
 }
 
 #[test]
+fn failed_export_removes_the_files_it_created() {
+    let tmp = tempfile::tempdir().unwrap();
+    export(tmp.path(), two(), false).unwrap();
+    let before = read(tmp.path().join(MANIFEST));
+    // A folder where the manifest's temporary file goes makes the run fail at the end.
+    let blocker = tmp.path().join(format!("{MANIFEST}.tmp"));
+    fs::create_dir(&blocker).unwrap();
+    fs::write(blocker.join("keep"), "x").unwrap();
+    let three = || {
+        let mut files = two();
+        files.push(file("g3", "Three", "three\n"));
+        files
+    };
+    for _ in 0..2 {
+        assert!(export(tmp.path(), three(), false).is_err());
+        assert_eq!(md_files(tmp.path()), ["One.md", "Two.md"]);
+        assert_eq!(read(tmp.path().join(MANIFEST)), before);
+        assert_eq!(read(blocker.join("keep")), "x");
+    }
+    fs::remove_dir_all(&blocker).unwrap();
+    assert_eq!(
+        export(tmp.path(), three(), false).unwrap(),
+        report(3, 1, 0, 0, 2)
+    );
+    assert_eq!(md_files(tmp.path()), ["One.md", "Three.md", "Two.md"]);
+}
+
+#[test]
+fn long_names_fit_in_255_bytes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let title = "😀".repeat(80);
+    let base = base_of(&title, "");
+    assert!(base.len() <= 200, "{}", base.len());
+    assert!(title.starts_with(&base));
+    let notes = vec![
+        file("g1", &title, "a\n"),
+        file("g2", &title, "b\n"),
+        file("g3", &"é".repeat(150), "c\n"),
+    ];
+    assert_eq!(
+        export(tmp.path(), notes, false).unwrap(),
+        report(3, 3, 0, 0, 0)
+    );
+    for name in md_files(tmp.path()) {
+        assert!(name.len() <= 255, "{}", name.len());
+    }
+}
+
+#[test]
+fn name_of_a_gone_note_is_not_reused() {
+    let tmp = tempfile::tempdir().unwrap();
+    export(tmp.path(), vec![file("old", "Same", "old\n")], false).unwrap();
+    let new = vec![file("new", "Same", "new\n")];
+    assert_eq!(
+        export(tmp.path(), new, true).unwrap(),
+        report(1, 1, 0, 1, 0)
+    );
+    let new = vec![file("new", "Same", "new\n")];
+    assert_eq!(
+        export(tmp.path(), new, false).unwrap(),
+        report(1, 1, 0, 1, 0)
+    );
+    assert_eq!(md_files(tmp.path()), ["Same 2.md"]);
+    assert_eq!(read(tmp.path().join("Same 2.md")), "new\n");
+}
+
+#[test]
 fn bad_manifest_is_an_error_and_writes_nothing() {
     for bad in [r#"{"version":2,"files":{}}"#, "not json", r#"{"files":{}}"#] {
         let tmp = tempfile::tempdir().unwrap();
