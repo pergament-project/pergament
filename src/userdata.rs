@@ -290,6 +290,39 @@ impl std::fmt::Debug for UserData {
     }
 }
 
+/// Register the SQL functions the merge queries rely on.
+fn register_functions(conn: &Connection) -> Result<()> {
+    // JW Library on iOS writes `LastModified` with a UTC offset without a
+    // colon (`+0100`), which `julianday()` cannot parse. Insert the colon so
+    // `±HHMM` becomes `±HH:MM`; every other form passes unchanged.
+    conn.create_scalar_function(
+        "normalize_timestamp",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let s = ctx.get::<String>(0)?;
+            let b = s.as_bytes();
+            if b.len() >= 5 {
+                let offset = &b[b.len() - 5..];
+                let sign = offset[0];
+                let digits = &offset[1..];
+                let plain = (sign == b'+' || sign == b'-')
+                    && digits.iter().all(u8::is_ascii_digit)
+                    && !digits.contains(&b':');
+                if plain {
+                    let mut out = String::with_capacity(s.len() + 1);
+                    out.push_str(&s[..s.len() - 2]);
+                    out.push(':');
+                    out.push_str(&s[s.len() - 2..]);
+                    return Ok(out);
+                }
+            }
+            Ok(s)
+        },
+    )?;
+    Ok(())
+}
+
 impl UserData {
     /// Open the database at `path`, creating an empty one if it is missing.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -301,6 +334,7 @@ impl UserData {
         conn.execute_batch(
             "PRAGMA trusted_schema = OFF; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000;",
         )?;
+        register_functions(&conn)?;
         let has_schema: bool = conn.query_row(
             "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'UserMark'",
             [],
@@ -713,7 +747,8 @@ impl UserData {
 
     fn notes_where(&self, condition: &str, values: &[&dyn rusqlite::ToSql]) -> Result<Vec<Note>> {
         let mut stmt = self.conn.prepare(&format!(
-            "{} {condition} ORDER BY n.LastModified DESC, n.NoteId DESC",
+            "{} {condition} ORDER BY julianday(normalize_timestamp(n.LastModified)) DESC,
+             n.NoteId DESC",
             Self::NOTE_SELECT
         ))?;
         let rows = stmt.query_map(values, |r| {
@@ -1399,8 +1434,8 @@ fn take_later_clock(tx: &Transaction<'_>) -> Result<()> {
     tx.execute(
         "UPDATE main.LastModified
          SET LastModified = (SELECT LastModified FROM inc.LastModified LIMIT 1)
-         WHERE julianday((SELECT LastModified FROM inc.LastModified LIMIT 1))
-               > julianday(LastModified)",
+         WHERE julianday(normalize_timestamp((SELECT LastModified FROM inc.LastModified LIMIT 1)))
+               > julianday(normalize_timestamp(LastModified))",
         [],
     )?;
     Ok(())
@@ -1410,8 +1445,8 @@ fn take_later_clock(tx: &Transaction<'_>) -> Result<()> {
 /// by the database-wide `LastModified`; `None` when equal or unknown.
 fn incoming_is_newer(tx: &Transaction<'_>) -> Result<Option<bool>> {
     let diff: Option<f64> = tx.query_row(
-        "SELECT julianday((SELECT LastModified FROM inc.LastModified))
-              - julianday((SELECT LastModified FROM main.LastModified))",
+        "SELECT julianday(normalize_timestamp((SELECT LastModified FROM inc.LastModified)))
+              - julianday(normalize_timestamp((SELECT LastModified FROM main.LastModified)))",
         [],
         |r| r.get(0),
     )?;
@@ -2238,7 +2273,8 @@ fn merge_notes(
         type LocalNote = (i64, Option<f64>, bool, Option<String>, Option<String>);
         let local: Option<LocalNote> = tx
             .query_row(
-                "SELECT m.NoteId, julianday(i.LastModified) - julianday(m.LastModified),
+                "SELECT m.NoteId, julianday(normalize_timestamp(i.LastModified))
+                                 - julianday(normalize_timestamp(m.LastModified)),
                         m.Title IS i.Title AND m.Content IS i.Content, m.Title, m.Content
                  FROM main.Note m, inc.Note i WHERE i.NoteId = ?1 AND m.Guid = i.Guid",
                 [note.id],
@@ -4538,6 +4574,89 @@ mod tests {
     fn assert_foreign_keys_hold(ud: &UserData) {
         let mut fk = ud.conn.prepare("PRAGMA foreign_key_check").unwrap();
         assert!(fk.query([]).unwrap().next().unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_notes_with_utc_offset_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut local = UserData::open(tmp.path().join("l").join(DB_NAME)).unwrap();
+        let guid = local
+            .save_note(Some(&bible(1)), None, &note_input("T", "old", &[]))
+            .unwrap();
+
+        let mut remote = UserData::open(tmp.path().join("r").join(DB_NAME)).unwrap();
+        remote
+            .restore_backup(&backup_of(&local, tmp.path(), "seed.jwlibrary"))
+            .unwrap();
+
+        // The remote note differs and is clearly newer, but its timestamp
+        // uses the iOS UTC offset form without a colon.
+        remote
+            .conn
+            .execute(
+                "UPDATE Note SET Content = 'new', Title = 'U' WHERE Guid = ?1",
+                [&guid],
+            )
+            .unwrap();
+        set_note_time(&remote, &guid, "2026-11-22T17:57:27+0100");
+        set_note_time(&local, &guid, "2026-11-22T15:00:00Z");
+        set_db_time(&remote, "2026-11-22T17:57:27+0100");
+        set_db_time(&local, "2026-11-22T15:00:00Z");
+
+        // Without normalization, julianday() is NULL for the backup's
+        // timestamp and the merge reports a conflict instead of taking the
+        // clearly newer note.
+        let r = local
+            .merge_backup(&backup_of(&remote, tmp.path(), "r.jwlibrary"))
+            .unwrap();
+        assert!(r.conflicts.iter().all(|c| c.guid != guid));
+        let merged = note(&local, &guid);
+        assert_eq!(merged.content, "new");
+        assert_eq!(merged.title, "U");
+    }
+
+    #[test]
+    fn test_normalize_timestamp() {
+        let conn = Connection::open_in_memory().unwrap();
+        register_functions(&conn).unwrap();
+
+        let tests = [
+            ("2026-11-22T17:57:27+0100", "2026-11-22T17:57:27+01:00"),
+            ("2026-11-22T17:57:27-0500", "2026-11-22T17:57:27-05:00"),
+            ("2026-11-22T17:57:27Z", "2026-11-22T17:57:27Z"),
+            ("2026-11-22T17:57:27+00:00", "2026-11-22T17:57:27+00:00"),
+            ("invalid", "invalid"),
+        ];
+
+        for (input, expected) in tests {
+            let normalized: String = conn
+                .query_row(&format!("SELECT normalize_timestamp('{input}')"), [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(normalized, expected);
+        }
+    }
+
+    #[test]
+    fn all_notes_orders_by_instant_not_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ud = UserData::open(tmp.path().join(DB_NAME)).unwrap();
+        let first = ud
+            .save_note(Some(&bible(1)), None, &note_input("first", "a", &[]))
+            .unwrap();
+        let second = ud
+            .save_note(Some(&bible(1)), None, &note_input("second", "b", &[]))
+            .unwrap();
+        // `second` reads 17:57+0200 (15:57 UTC) and `first` reads 16:00Z
+        // (16:00 UTC). By text `second` would come first; by instant `first` is
+        // newer and must come first.
+        set_note_time(&ud, &second, "2026-11-22T17:57:27+0200");
+        set_note_time(&ud, &first, "2026-11-22T16:00:00Z");
+
+        let notes: Vec<_> = ud.all_notes(None).unwrap();
+        let titles: Vec<_> = notes.iter().map(|n| n.title.clone()).collect();
+        assert_eq!(titles, ["first", "second"]);
     }
 
     /// The `LocationId` of a `nwtsty` row (book 19), adding it when missing.
