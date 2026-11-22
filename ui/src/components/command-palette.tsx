@@ -14,7 +14,7 @@ import { passageLabel, planStatus, planTitle } from "@/lib/reading-plans";
 
 /** The global command palette for navigation and quick actions. */
 export function CommandPalette() {
-  const { publications, push, openTarget, toast, lang, bibles, view, openNote } = useApp();
+  const { publications, push, openTarget, toast, lang, bibles, view, openNote, switchTo } = useApp();
   const [open, setOpen] = useState(false);
   const [shortcutHelp, setShortcutHelp] = useState(false);
   const [query, setQuery] = useState("");
@@ -143,7 +143,9 @@ export function CommandPalette() {
               <CommandItem
                 onSelect={() => {
                   close();
-                  void openNote({ note: {} });
+                  // The editor lives on Personal Study, which opens it once shown.
+                  if (view.name === "personal") void openNote({ note: {} }, { in: "pane" });
+                  else switchTo("personal", { name: "personal", newNote: true }, undefined, [{ name: "personal", newNote: true }]);
                 }}
               >
                 {t("New note")}

@@ -455,23 +455,54 @@ describe("Note in the study pane", () => {
     expect(screen.getByTestId("versions").textContent).toBe("0/1");
   });
 
-  it("starts a note in Personal Study without a page", async () => {
+  it("writes a new note on Personal Study and saves it without a page", async () => {
     backend.save_note = () => "n1";
     backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null });
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [];
-    renderIn(
-      <>
-        <PersonalView />
-        <InlineNoteEditor />
-      </>,
-    );
-    backend.open_note_window = () => undefined;
+    renderIn(<PersonalView />);
     fireEvent.click(await screen.findByRole("button", { name: "New note" }));
-    await waitFor(() =>
-      expect(vi.mocked(emitTo)).toHaveBeenCalledWith("note", "note-open", expect.objectContaining({ draft: { note: {} } })),
-    );
+    const editor = await screen.findByRole("form", { name: "New note" });
+    expect(calls.some((c) => c.cmd === "open_note_window")).toBe(false);
+    fireEvent.change(within(editor).getByPlaceholderText("Note"), { target: { value: "Ideas" } });
+    fireEvent.click(within(editor).getByText("Save"));
+    await waitFor(() => expect(calls.some((c) => c.cmd === "save_note")).toBe(true));
+    expect(calls.find((c) => c.cmd === "save_note")!.args).toMatchObject({ target: null, note: { content: "Ideas", markGuid: null } });
+    await waitFor(() => expect(screen.queryByRole("form")).toBeNull());
+  });
+
+  it("opens an empty note on Personal Study when asked from elsewhere", async () => {
+    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null });
+    backend.tags = () => [];
+    backend.bookmarks = () => [];
+    backend.all_notes = () => [];
+    function Shown() {
+      const { view, switchTo } = useApp();
+      return view.name === "personal" ? (
+        <PersonalView />
+      ) : (
+        <button onClick={() => switchTo("personal", { name: "personal", newNote: true }, undefined, [{ name: "personal", newNote: true }])}>go</button>
+      );
+    }
+    renderIn(<Shown />);
+    fireEvent.click(screen.getByText("go"));
+    expect(await screen.findByRole("form", { name: "New note" })).toBeTruthy();
+    expect(calls.some((c) => c.cmd === "open_note_window")).toBe(false);
+  });
+
+  it("edits a note without a page in place on Personal Study", async () => {
+    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, device: null });
+    backend.tags = () => [];
+    backend.bookmarks = () => [];
+    backend.all_notes = () => [
+      { guid: "a", title: "Loose thought", content: "", blockType: 0, blockIdentifier: null, markGuid: null, color: null, tags: [], lastModified: "2026-10-03T00:00:00Z", location: null },
+    ];
+    renderIn(<PersonalView />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit note" }));
+    const editor = await screen.findByRole("form", { name: "Edit note" });
+    expect((within(editor).getByDisplayValue("Loose thought") as HTMLInputElement).value).toBe("Loose thought");
+    expect(calls.some((c) => c.cmd === "open_note_window")).toBe(false);
   });
 
   it("saves a note without a page as free-standing", async () => {
