@@ -1626,3 +1626,67 @@ describe("folder sync", () => {
     });
   });
 });
+
+describe("export notes", () => {
+  const report = (over: object = {}) => ({ notes: 3, created: 3, updated: 0, removed: 0, unchanged: 0, ...over });
+  const exportCalls = () => calls.filter((c) => c.cmd === "export_notes");
+  beforeEach(() => {
+    vi.mocked(ask).mockReset();
+    vi.mocked(open).mockReset();
+    backend.cache_usage = () => ({ catalog: 0, covers: 0, partial: 0, other: 0, total: 0 });
+    backend.auto_settings = () => ({ rolling: { enabled: true, keep: 10 }, sync: { folder: null, deviceId: null } });
+    backend.sync_status = () => ({ folder: null, lastSync: null, lastDevice: null, error: null, pending: [], conflicts: [] });
+  });
+  const exportTo = async () => {
+    renderIn(<SettingsView />);
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: "Library & data" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Export to folder…" }));
+  };
+
+  it("exports without asking when nothing is overwritten", async () => {
+    vi.mocked(open).mockResolvedValue("/tmp/notes");
+    backend.export_notes = ({ dryRun }) => report(dryRun ? {} : { notes: 3 });
+    await exportTo();
+    expect(await screen.findByText("Exported 3 notes")).toBeTruthy();
+    expect(ask).not.toHaveBeenCalled();
+    expect(exportCalls().map((c) => c.args)).toEqual([
+      { folder: "/tmp/notes", dryRun: true },
+      { folder: "/tmp/notes", dryRun: false },
+    ]);
+  });
+
+  it("stops when the overwrite is declined", async () => {
+    vi.mocked(open).mockResolvedValue("/tmp/notes");
+    vi.mocked(ask).mockResolvedValue(false);
+    backend.export_notes = () => report({ created: 2, updated: 1 });
+    await exportTo();
+    await waitFor(() => expect(ask).toHaveBeenCalled());
+    expect(vi.mocked(ask).mock.calls[0]).toEqual([
+      "1 exported notes will be overwritten and 0 removed. Changes made to them in the folder are lost.",
+      { title: "Update exported notes?", kind: "warning", okLabel: "Export" },
+    ]);
+    await act(async () => {
+      await vi.mocked(ask).mock.results[0].value;
+    });
+    expect(exportCalls()).toHaveLength(1);
+    expect(exportCalls()[0].args).toEqual({ folder: "/tmp/notes", dryRun: true });
+  });
+
+  it("does nothing when the folder dialog is cancelled", async () => {
+    vi.mocked(open).mockResolvedValue(null);
+    backend.export_notes = () => report();
+    await exportTo();
+    await waitFor(() => expect(open).toHaveBeenCalled());
+    await act(async () => undefined);
+    expect(exportCalls()).toHaveLength(0);
+  });
+
+  it("shows a failing export", async () => {
+    vi.mocked(open).mockResolvedValue("/tmp/notes");
+    backend.export_notes = () => {
+      throw "disk full";
+    };
+    await exportTo();
+    expect(await screen.findByText("Could not export notes: disk full")).toBeTruthy();
+  });
+});

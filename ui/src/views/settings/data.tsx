@@ -80,6 +80,49 @@ function CacheSection() {
   );
 }
 
+function ExportNotesSection() {
+  const { toast } = useApp();
+  const [busy, setBusy] = useState(false);
+  const exportNotes = async () => {
+    setBusy(true);
+    try {
+      const picked = await openDialog({ directory: true, multiple: false });
+      const path = Array.isArray(picked) ? picked[0] : picked;
+      if (!path) return;
+      const plan = await api.exportNotes(path, true);
+      if (plan.updated + plan.removed > 0) {
+        const ok = await ask(
+          t(
+            "{updated} exported notes will be overwritten and {removed} removed. Changes made to them in the folder are lost.",
+            { updated: plan.updated, removed: plan.removed },
+          ),
+          { title: t("Update exported notes?"), kind: "warning", okLabel: t("Export") },
+        );
+        if (!ok) return;
+      }
+      const report = await api.exportNotes(path, false);
+      toast(t("Exported {count} notes", { count: report.notes }));
+    } catch (e) {
+      toast(t("Could not export notes: {error}", { error: String(e) }));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section>
+      <h2 className="mb-3 text-sm font-semibold">{t("Export notes")}</h2>
+      <Button variant="outline" onClick={() => void exportNotes()} disabled={busy}>
+        {t("Export to folder…")}
+      </Button>
+      <p className="mt-2 max-w-xl text-sm text-muted">
+        {t(
+          "Writes each note as a Markdown file into a folder you choose, readable in Obsidian or any text editor. Exporting into the same folder again updates those files; changes made to them there are overwritten.",
+        )}
+      </p>
+    </section>
+  );
+}
+
 function lastSynced(s: SyncStatus): string {
   const time = new Date((s.lastSync ?? 0) * 1000).toLocaleString(locale(), { dateStyle: "medium", timeStyle: "short" });
   return s.lastDevice ? t("Last synced {time} with {device}", { time, device: s.lastDevice }) : t("Last synced {time}", { time });
@@ -309,6 +352,7 @@ export function DataTab() {
           )}
         </p>
       </section>
+      <ExportNotesSection />
       <AutoBackupSection />
       <CacheSection />
     </div>
