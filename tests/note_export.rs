@@ -176,6 +176,26 @@ fn owned_file_gone_from_disk_is_dropped_silently() {
 }
 
 #[test]
+fn replaced_by_a_case_variant_is_left_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    export(tmp.path(), vec![file("g1", "Hello", "note\n")], false).unwrap();
+    fs::remove_file(tmp.path().join("Hello.md")).unwrap();
+    fs::write(tmp.path().join("hello.md"), "mine").unwrap();
+    assert_eq!(
+        export(tmp.path(), vec![], false).unwrap(),
+        report(0, 0, 0, 0, 0)
+    );
+    assert_eq!(read(tmp.path().join("hello.md")), "mine");
+    let notes = vec![file("g1", "Hello", "note\n")];
+    assert_eq!(
+        export(tmp.path(), notes, false).unwrap(),
+        report(1, 1, 0, 0, 0)
+    );
+    assert_eq!(read(tmp.path().join("hello.md")), "mine");
+    assert_eq!(read(tmp.path().join("Hello 2.md")), "note\n");
+}
+
+#[test]
 fn foreign_files_are_left_alone() {
     for foreign in ["Hello.md", "hello.md"] {
         let tmp = tempfile::tempdir().unwrap();

@@ -193,6 +193,23 @@ fn is_regular_file(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
 
+/// Whether the manifest's `name` is a file an earlier export wrote: a regular
+/// file at its path, unless the folder lists a case variant of it instead. A
+/// case-insensitive file system finds the user's `hello.md` at `Hello.md`; a
+/// name in another Unicode normalization (HFS+) is no case variant and stays ours.
+fn is_owned(name: &str, listed: &HashSet<String>, is_regular: bool) -> bool {
+    if !is_regular {
+        return false;
+    }
+    if listed.contains(name) {
+        return true;
+    }
+    let lower = name.to_lowercase();
+    !listed
+        .iter()
+        .any(|n| n != name && n.to_lowercase() == lower)
+}
+
 /// Whether `name` is `{base}.md` or `{base} N.md`, ignoring case.
 fn is_name_of(name: &str, base: &str) -> bool {
     let (name, base) = (name.to_lowercase(), base.to_lowercase());
@@ -215,7 +232,7 @@ pub fn export(folder: &Path, files: Vec<NoteFile>, dry_run: bool) -> Result<Expo
     // Only regular files the manifest names are ours; a link or folder never is.
     let owned: BTreeMap<String, String> = manifest
         .into_iter()
-        .filter(|(name, _)| is_regular_file(&folder.join(name)))
+        .filter(|(name, _)| is_owned(name, &on_disk, is_regular_file(&folder.join(name))))
         .collect();
     let owned_lower: HashMap<String, &str> = owned
         .keys()
@@ -403,4 +420,39 @@ pub fn export_notes(
         files.push(note_file(note, &body, &anchor));
     }
     export(folder, files, dry_run)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listed(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn case_variant_of_a_manifest_name_is_not_owned() {
+        // Case-insensitive file system: `Hello.md` was replaced by the user's `hello.md`.
+        assert!(!is_owned("Hello.md", &listed(&["hello.md"]), true));
+        assert!(!is_owned("Hello.md", &listed(&["HELLO.MD", "x.md"]), true));
+    }
+
+    #[test]
+    fn listed_or_normalized_manifest_name_is_owned() {
+        assert!(is_owned("Hello.md", &listed(&["Hello.md"]), true));
+        // Case-sensitive file system with both spellings: the exact one is ours.
+        assert!(is_owned(
+            "Hello.md",
+            &listed(&["Hello.md", "hello.md"]),
+            true
+        ));
+        // NFD file system lists `é` decomposed; that isn't a case variant.
+        assert!(is_owned("Caf\u{e9}.md", &listed(&["Cafe\u{301}.md"]), true));
+    }
+
+    #[test]
+    fn missing_or_irregular_manifest_name_is_not_owned() {
+        assert!(!is_owned("Hello.md", &listed(&["Hello.md"]), false));
+        assert!(!is_owned("Hello.md", &listed(&[]), false));
+    }
 }
