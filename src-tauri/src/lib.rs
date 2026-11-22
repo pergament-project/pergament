@@ -985,6 +985,34 @@ async fn export_backup(app: AppHandle, path: String) -> ApiResult<()> {
     .map_err(|e| e.to_string())?
 }
 
+/// The Markdown of a note, to copy.
+#[tauri::command]
+fn note_markdown(state: State<'_, AppState>, request: api::MarkdownRequest) -> ApiResult<String> {
+    api::markdown_for(&*state.lib()?, &*state.user()?, &request)
+}
+
+/// Write every note as a Markdown file into `folder`, or only count what would change.
+#[tauri::command]
+async fn export_notes(
+    app: AppHandle,
+    folder: String,
+    dry_run: bool,
+) -> ApiResult<pergament::note_export::ExportReport> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _job = state.job();
+        pergament::note_export::export_notes(
+            &*state.lib()?,
+            &*state.user()?,
+            Path::new(&folder),
+            dry_run,
+        )
+        .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Replace all user data with a `.jwlibrary` backup. A rolling backup of
 /// the current data is written first, as the safety copy does not outlive
 /// the next sync merge. With sync on, the own file is written right away,
@@ -1928,6 +1956,8 @@ pub fn run() {
             user_data_summary,
             open_location,
             export_backup,
+            export_notes,
+            note_markdown,
             restore_backup,
             merge_backup,
             auto_settings,

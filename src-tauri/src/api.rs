@@ -12,12 +12,13 @@ use pergament::library::MediaEntry;
 use pergament::links::{Link, MediaKind, MediaRef};
 use pergament::mediator;
 use pergament::navigate::{self, Page, Target, TargetKind};
+use pergament::note_markdown;
 use pergament::reader::{BibleBook, TocNode};
 use pergament::render::{RenderOptions, Renderer, media_name};
 use pergament::search::{SearchRequest, SearchResponse, SearchStatus};
 use pergament::userdata::{Loc, Mark, Note, PublicationKey, UserData};
 use pergament::{Entry, Library, Publication};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub type ApiResult<T> = Result<T, String>;
 
@@ -927,6 +928,69 @@ pub fn page_user_data(
     })
 }
 
+/// Fields of a note being edited, which may differ from the saved note.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownText {
+    pub title: String,
+    pub content: String,
+    pub tags: Vec<String>,
+}
+
+/// A note to copy: a saved one by `guid`, or one being written on `target`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownRequest {
+    pub guid: Option<String>,
+    pub target: Option<Target>,
+    #[serde(default)]
+    pub block_type: i64,
+    pub block_identifier: Option<i64>,
+    pub text: Option<MarkdownText>,
+}
+
+/// The Markdown of the note `request` names, with its edited text if given.
+pub fn markdown_for(
+    library: &Library,
+    user: &UserData,
+    request: &MarkdownRequest,
+) -> ApiResult<String> {
+    let (anchor, saved) = if let Some(guid) = &request.guid {
+        let note = user
+            .note(guid)
+            .map_err(err)?
+            .ok_or_else(|| format!("no note {guid}"))?;
+        let location = note.location.as_ref();
+        let anchor = note_markdown::resolve(
+            library,
+            location.map(|l| &l.loc),
+            location.and_then(|l| l.title.as_deref()),
+            note.block_type,
+            note.block_identifier,
+        )
+        .map_err(err)?;
+        (anchor, Some(note))
+    } else if let Some(target) = &request.target {
+        let (loc, title) = page_location(library, target)?;
+        let anchor = note_markdown::resolve(
+            library,
+            Some(&loc),
+            Some(&title),
+            request.block_type,
+            request.block_identifier,
+        )
+        .map_err(err)?;
+        (anchor, None)
+    } else {
+        (note_markdown::Anchor::default(), None)
+    };
+    match (&request.text, &saved) {
+        (Some(t), _) => Ok(note_markdown::body(&t.title, &t.content, &t.tags, &anchor)),
+        (None, Some(n)) => Ok(note_markdown::body(&n.title, &n.content, &n.tags, &anchor)),
+        (None, None) => Err("nothing to copy".into()),
+    }
+}
+
 /// Where to open a note's or bookmark's page, if its publication is downloaded.
 pub fn open_location(library: &Library, loc: &Loc) -> ApiResult<Option<Target>> {
     let Some(publication) =
@@ -1755,6 +1819,55 @@ mod tests {
                 .is_none()
         );
         assert!(dated_page(&lib, "X", "nope", "2026-10-07").is_err());
+    }
+
+    #[test]
+    fn markdown_of_a_saved_note_or_its_edited_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = Library::open(tmp.path().join("lib")).unwrap();
+        let mut user = UserData::open(tmp.path().join("userData.db")).unwrap();
+        let note = pergament::userdata::NoteInput {
+            title: "Saved".into(),
+            content: "saved text".into(),
+            tags: vec!["Prayer".into()],
+            ..Default::default()
+        };
+        let guid = user.save_note(None, None, &note).unwrap();
+
+        let saved = MarkdownRequest {
+            guid: Some(guid.clone()),
+            target: None,
+            block_type: 0,
+            block_identifier: None,
+            text: None,
+        };
+        assert_eq!(
+            markdown_for(&lib, &user, &saved).unwrap(),
+            "**Saved**\n\nsaved text\n\n#Prayer\n"
+        );
+
+        let edited = MarkdownRequest {
+            text: Some(MarkdownText {
+                title: "Edited".into(),
+                content: "new text".into(),
+                tags: vec![],
+            }),
+            ..saved
+        };
+        assert_eq!(
+            markdown_for(&lib, &user, &edited).unwrap(),
+            "**Edited**\n\nnew text\n"
+        );
+
+        let nothing = MarkdownRequest {
+            guid: None,
+            text: None,
+            ..edited
+        };
+        assert_eq!(
+            markdown_for(&lib, &user, &nothing).unwrap_err(),
+            "nothing to copy"
+        );
     }
 
     #[test]

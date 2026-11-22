@@ -323,6 +323,15 @@ export interface NoteInput {
   tags: string[];
 }
 
+/** A note to copy as Markdown: a saved one by `guid`, or one being written on `target`. */
+export interface MarkdownRequest {
+  guid?: string | null;
+  target?: Target | null;
+  blockType?: number;
+  blockIdentifier?: number | null;
+  text?: { title: string; content: string; tags: string[] } | null;
+}
+
 export interface DaySpan {
   day: number;
   startBook: number;
@@ -371,6 +380,15 @@ export interface MergeReport {
   unchanged: number;
   conflicts: Conflict[];
   device: string | null;
+}
+
+/** What an export of the notes to a folder did, or would do. */
+export interface ExportReport {
+  notes: number;
+  created: number;
+  updated: number;
+  removed: number;
+  unchanged: number;
 }
 
 export interface UserDataSummary {
@@ -538,6 +556,8 @@ export const api = {
   userDataSummary: () => invoke<UserDataSummary>("user_data_summary"),
   openLocation: (loc: Loc) => invoke<Target | null>("open_location", { loc }),
   exportBackup: (path: string) => invoke<void>("export_backup", { path }),
+  noteMarkdown: (request: MarkdownRequest) => invoke<string>("note_markdown", { request }),
+  exportNotes: (folder: string, dryRun: boolean) => invoke<ExportReport>("export_notes", { folder, dryRun }),
   restoreBackup: (path: string) => invoke<UserDataSummary>("restore_backup", { path }),
   mergeBackup: (path: string) => invoke<MergeReport>("merge_backup", { path }),
   autoSettings: () => invoke<AutoSettings>("auto_settings"),
