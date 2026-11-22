@@ -202,6 +202,15 @@ describe("Settings", () => {
     expect(screen.getByRole("radio", { name: "Full width" }).getAttribute("aria-checked")).toBe("true");
   });
 
+  it("chooses where notes open and remembers it", async () => {
+    renderIn(<SettingsView />);
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: "Interface" }));
+    expect((await screen.findByRole("radio", { name: "In the page" })).getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(screen.getByRole("radio", { name: "In a separate window" }));
+    expect(localStorage.getItem("noteOpen")).toBe("window");
+    expect(screen.getByRole("radio", { name: "In a separate window" }).getAttribute("aria-checked")).toBe("true");
+  });
+
   it("picks the interface language from a list", async () => {
     renderIn(<SettingsView />);
     fireEvent.mouseDown(await screen.findByRole("tab", { name: "Interface" }));
@@ -489,6 +498,21 @@ describe("Note in the study pane", () => {
     fireEvent.click(screen.getByText("go"));
     expect(await screen.findByRole("form", { name: "New note" })).toBeTruthy();
     expect(calls.some((c) => c.cmd === "open_note_window")).toBe(false);
+  });
+
+  it("opens notes in the note window when the setting asks for it", async () => {
+    localStorage.setItem("noteOpen", "window");
+    backend.open_note_window = () => undefined;
+    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null });
+    backend.tags = () => [];
+    backend.bookmarks = () => [];
+    backend.all_notes = () => [];
+    renderIn(<PersonalView />);
+    fireEvent.click(await screen.findByRole("button", { name: "New note" }));
+    await waitFor(() =>
+      expect(vi.mocked(emitTo)).toHaveBeenCalledWith("note", "note-open", expect.objectContaining({ draft: { note: {} } })),
+    );
+    expect(screen.queryByRole("form")).toBeNull();
   });
 
   it("edits a note without a page in place on Personal Study", async () => {

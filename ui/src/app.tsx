@@ -43,6 +43,7 @@ import {
   loadLayout,
   loadReadingFont,
   loadMergeBackups,
+  loadNoteOpen,
   loadNoteWindowSize,
   loadSecondDisplay,
   loadUpdateCheck,
@@ -57,8 +58,10 @@ import {
   saveLayout,
   saveReadingFont,
   saveMergeBackups,
+  saveNoteOpen,
   type ReadingFont,
   type Layout,
+  type NoteOpen,
   saveBibles,
   saveLang,
   saveUiLang,
@@ -125,6 +128,9 @@ interface AppContextValue {
   /** Restoring a backup merges it into the data instead of replacing them. */
   mergeBackups: boolean;
   setMergeBackups: (on: boolean) => void;
+  /** Where a note opens when it is asked for in the page. */
+  noteOpen: NoteOpen;
+  setNoteOpen: (where: NoteOpen) => void;
   importFiles: () => Promise<void>;
   /** Symbol of the Bible last picked per language code. */
   bibles: Record<string, string>;
@@ -230,6 +236,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [layout, setLayoutState] = useState<Layout>(loadLayout);
   const [readingFont, setReadingFontState] = useState<ReadingFont>(loadReadingFont);
   const [mergeBackups, setMergeBackupsState] = useState(loadMergeBackups);
+  const [noteOpen, setNoteOpenState] = useState<NoteOpen>(loadNoteOpen);
   const [lang, setLangState] = useState(loadLang);
   const [bibles, setBibles] = useState(loadBibles);
   const [uiLang, setUiLangState] = useState<UiLangSetting>(loadUiLang);
@@ -800,7 +807,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setNote({ ...current, fields: noteFields.current });
   }, []);
   const openNote = useCallback(
-    async (draft: NoteDraft, { in: where = "window" }: { in?: "pane" | "window" } = {}) => {
+    async (draft: NoteDraft, { in: asked = "window" }: { in?: "pane" | "window" } = {}) => {
+      // The setting can send notes that would open in the page to the note window instead.
+      const where = noteOpen === "window" ? "window" : asked;
       if (where === "window") {
         // Moved text the window has not taken yet would be replaced without a question; its own text it asks about.
         if (movedPending.current) return noteWindowBusy();
@@ -811,7 +820,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       noteFields.current = null;
       setNote({ id: Date.now(), draft });
     },
-    [mayDiscard, noteWindowBusy, showInWindow],
+    [mayDiscard, noteOpen, noteWindowBusy, showInWindow],
   );
   const closeNote = useCallback(
     async (id?: number, { force = false } = {}) => {
@@ -942,6 +951,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
         saveMergeBackups(on);
         setMergeBackupsState(on);
       },
+      noteOpen,
+      setNoteOpen: (where) => {
+        saveNoteOpen(where);
+        setNoteOpenState(where);
+      },
       importFiles,
       bibles,
       chooseBible: (code, symbol) =>
@@ -1017,6 +1031,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       layout,
       readingFont,
       mergeBackups,
+      noteOpen,
       importFiles,
       lang,
       bibles,

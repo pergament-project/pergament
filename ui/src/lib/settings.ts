@@ -63,6 +63,17 @@ export function saveMergeBackups(on: boolean) {
   write("mergeBackups", String(on));
 }
 
+/** Where notes open: in the page they belong to (the default) or in the separate note window. */
+export type NoteOpen = "page" | "window";
+
+export function loadNoteOpen(): NoteOpen {
+  return read("noteOpen") === "window" ? "window" : "page";
+}
+
+export function saveNoteOpen(where: NoteOpen) {
+  write("noteOpen", where);
+}
+
 /** Content width: a centered column (the default) or the whole window. */
 export type Layout = "centered" | "wide";
 
