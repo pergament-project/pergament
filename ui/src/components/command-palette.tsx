@@ -14,7 +14,7 @@ import { passageLabel, planStatus, planTitle } from "@/lib/reading-plans";
 
 /** The global command palette for navigation and quick actions. */
 export function CommandPalette() {
-  const { publications, push, openTarget, toast, lang, bibles, view } = useApp();
+  const { publications, push, openTarget, toast, lang, bibles, view, openNote } = useApp();
   const [open, setOpen] = useState(false);
   const [shortcutHelp, setShortcutHelp] = useState(false);
   const [query, setQuery] = useState("");
@@ -139,6 +139,14 @@ export function CommandPalette() {
                 }}
               >
                 {t("Daily Text")}
+              </CommandItem>
+              <CommandItem
+                onSelect={() => {
+                  close();
+                  void openNote({ note: {} });
+                }}
+              >
+                {t("New note")}
               </CommandItem>
               <CommandItem onSelect={() => { close(); setShortcutHelp(true); }}>
                 {t("Keyboard shortcuts")}

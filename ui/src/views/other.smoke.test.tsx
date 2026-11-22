@@ -455,6 +455,44 @@ describe("Note in the study pane", () => {
     expect(screen.getByTestId("versions").textContent).toBe("0/1");
   });
 
+  it("starts a note in Personal Study without a page", async () => {
+    backend.save_note = () => "n1";
+    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null });
+    backend.tags = () => [];
+    backend.bookmarks = () => [];
+    backend.all_notes = () => [];
+    renderIn(
+      <>
+        <PersonalView />
+        <InlineNoteEditor />
+      </>,
+    );
+    backend.open_note_window = () => undefined;
+    fireEvent.click(await screen.findByRole("button", { name: "New note" }));
+    await waitFor(() =>
+      expect(vi.mocked(emitTo)).toHaveBeenCalledWith("note", "note-open", expect.objectContaining({ draft: { note: {} } })),
+    );
+  });
+
+  it("saves a note without a page as free-standing", async () => {
+    backend.save_note = () => "n2";
+    renderIn(
+      <>
+        <Harness />
+        <InlineNoteEditor />
+      </>,
+    );
+    fireEvent.click(screen.getByText("other"));
+    const editor = await screen.findByRole("form", { name: "New note" });
+    fireEvent.change(within(editor).getByPlaceholderText("Note"), { target: { value: "Ideas" } });
+    fireEvent.click(within(editor).getByText("Save"));
+    await waitFor(() => expect(calls.some((c) => c.cmd === "save_note")).toBe(true));
+    expect(calls.find((c) => c.cmd === "save_note")!.args).toEqual({
+      target: null,
+      note: { title: "Another", content: "Ideas", tags: [], guid: undefined, blockType: 0, blockIdentifier: null, markGuid: null },
+    });
+  });
+
   it("previews Markdown and opens its links in the browser", async () => {
     backend.open_external = () => undefined;
     renderIn(

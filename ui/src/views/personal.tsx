@@ -88,6 +88,12 @@ export function PersonalView() {
           <ReadingPlansSection />
 
           <SectionTitle>Notes and Tags</SectionTitle>
+          <button
+            onClick={() => void openNote({ note: {} })}
+            className="mb-4 flex items-center gap-2 rounded-md border border-line bg-surface px-4 py-2 text-sm hover:bg-bar"
+          >
+            <Plus size={17} /> {t("New note")}
+          </button>
           {tags.length > 0 && (
             <div className="mb-4 flex flex-wrap gap-1.5">
               <Chip active={tag === null} onClick={() => setTag(null)}>
