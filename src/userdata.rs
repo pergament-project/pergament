@@ -822,7 +822,8 @@ impl UserData {
         }
     }
 
-    /// Create or update a note; returns its guid. `loc` is needed to create.
+    /// Create or update a note; returns its guid. `loc` anchors a new note;
+    /// omit it to create a free-standing note with no page or highlight.
     pub fn save_note(
         &mut self,
         loc: Option<&Loc>,
@@ -851,8 +852,10 @@ impl UserData {
                 (id, guid)
             }
             None => {
-                let loc = loc.ok_or_else(|| Error::NotFound("page for the new note".into()))?;
-                let location = Self::location_id(&tx, loc, title)?;
+                let location: Option<i64> = match loc {
+                    Some(loc) => Some(Self::location_id(&tx, loc, title)?),
+                    None => None,
+                };
                 let mark: Option<i64> = match &note.mark_guid {
                     Some(g) => tx
                         .query_row(
@@ -865,7 +868,9 @@ impl UserData {
                 };
                 let (block_type, block) = match note.block_identifier {
                     Some(b)
-                        if note.block_type == BLOCK_PARAGRAPH || note.block_type == BLOCK_VERSE =>
+                        if location.is_some()
+                            && (note.block_type == BLOCK_PARAGRAPH
+                                || note.block_type == BLOCK_VERSE) =>
                     {
                         (note.block_type, Some(b))
                     }
@@ -4544,6 +4549,35 @@ mod tests {
                 [guid, ts],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn create_free_standing_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ud = UserData::open(tmp.path().join(DB_NAME)).unwrap();
+        // A block without a page is dropped, as JW Library stores it.
+        let note_data = NoteInput {
+            block_type: BLOCK_VERSE,
+            block_identifier: Some(3),
+            ..note_input("Free", "content", &["study"])
+        };
+        let guid = ud.save_note(None, None, &note_data).unwrap();
+
+        let saved = note(&ud, &guid);
+        assert!(saved.location.is_none());
+        assert!(saved.mark_guid.is_none());
+        assert_eq!((saved.block_type, saved.block_identifier), (0, None));
+        assert_eq!(saved.content, "content");
+        assert_eq!(saved.tags, ["study"]);
+        let (location, mark): (Option<i64>, Option<i64>) = ud
+            .conn
+            .query_row(
+                "SELECT LocationId, UserMarkId FROM Note WHERE Guid = ?1",
+                [&guid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((location, mark), (None, None));
     }
 
     fn note_input(title: &str, content: &str, tags: &[&str]) -> NoteInput {
