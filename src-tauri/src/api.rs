@@ -938,6 +938,7 @@ pub struct MarkdownText {
 }
 
 /// A note to copy: a saved one by `guid`, or one being written on `target`.
+/// With a `guid`, the saved note's anchor is used and `target` and the block fields are ignored.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MarkdownRequest {
@@ -1867,6 +1868,58 @@ mod tests {
         assert_eq!(
             markdown_for(&lib, &user, &nothing).unwrap_err(),
             "nothing to copy"
+        );
+    }
+
+    #[test]
+    fn markdown_of_a_saved_note_keeps_its_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = Library::open(tmp.path().join("lib")).unwrap();
+        let mut user = UserData::open(tmp.path().join("userData.db")).unwrap();
+        let loc = Loc {
+            key_symbol: "zzz".into(),
+            meps_language: 0,
+            issue_tag: 0,
+            document_id: Some(7),
+            book: None,
+            chapter: None,
+        };
+        let note = pergament::userdata::NoteInput {
+            title: "Anchored".into(),
+            content: "saved text".into(),
+            block_type: pergament::userdata::BLOCK_PARAGRAPH,
+            block_identifier: Some(3),
+            ..Default::default()
+        };
+        let guid = user
+            .save_note(Some(&loc), Some("Stored Title"), &note)
+            .unwrap();
+
+        let saved = MarkdownRequest {
+            guid: Some(guid),
+            target: None,
+            block_type: 0,
+            block_identifier: None,
+            text: None,
+        };
+        assert_eq!(
+            markdown_for(&lib, &user, &saved).unwrap(),
+            "**Anchored**\n\n— Stored Title\n\nsaved text\n"
+        );
+
+        let edited = MarkdownRequest {
+            block_type: pergament::userdata::BLOCK_VERSE,
+            block_identifier: Some(99),
+            text: Some(MarkdownText {
+                title: "Anchored".into(),
+                content: "new text".into(),
+                tags: vec![],
+            }),
+            ..saved
+        };
+        assert_eq!(
+            markdown_for(&lib, &user, &edited).unwrap(),
+            "**Anchored**\n\n— Stored Title\n\nnew text\n"
         );
     }
 

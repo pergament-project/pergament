@@ -488,3 +488,27 @@ fn exports_the_notes_of_user_data() {
         report(2, 0, 0, 0, 2)
     );
 }
+
+#[test]
+fn exports_only_into_an_absolute_folder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let lib = Library::open(tmp.path().join("lib")).unwrap();
+    let mut user = UserData::open(tmp.path().join("userData.db")).unwrap();
+    let note = NoteInput {
+        title: "Loose".into(),
+        content: "text".into(),
+        ..NoteInput::default()
+    };
+    user.save_note(None, None, &note).unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    for folder in ["", "rel"] {
+        for dry_run in [false, true] {
+            assert!(export_notes(&lib, &user, Path::new(folder), dry_run).is_err());
+            assert!(export(Path::new(folder), two(), dry_run).is_err());
+        }
+    }
+    assert!(!cwd.join("rel").exists());
+    assert!(!cwd.join(MANIFEST).exists());
+    assert!(!cwd.join("Loose.md").exists());
+    assert!(!cwd.join("One.md").exists());
+}

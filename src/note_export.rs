@@ -211,8 +211,18 @@ fn is_name_of(name: &str, base: &str) -> bool {
         })
 }
 
+/// An error unless `folder` is an absolute path, so nothing lands in the working directory.
+fn check_folder(folder: &Path) -> Result<()> {
+    if folder.is_absolute() {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!("not a folder: {folder:?}")))
+    }
+}
+
 /// Writes `files` into `folder` and mirrors earlier exports there; with `dry_run` only counts.
 pub fn export(folder: &Path, files: Vec<NoteFile>, dry_run: bool) -> Result<ExportReport> {
+    check_folder(folder)?;
     let manifest = read_manifest(folder)?;
     let on_disk = list_folder(folder)?;
     // Only regular files the manifest names are ours; a link or folder never is.
@@ -391,6 +401,7 @@ pub fn export_notes(
     folder: &Path,
     dry_run: bool,
 ) -> Result<ExportReport> {
+    check_folder(folder)?;
     let notes = user.all_notes(None)?;
     let mut publications = Publications::open(
         library,
