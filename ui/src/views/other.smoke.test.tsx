@@ -365,6 +365,19 @@ describe("Personal Study", () => {
     expect(card.querySelector("b")).toBeNull();
     expect(card.textContent).toContain("<b>raw</b>");
   });
+
+  it("copies a note as Markdown", async () => {
+    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, device: null });
+    backend.tags = () => [];
+    backend.bookmarks = () => [];
+    backend.all_notes = () => [note("a", "T", null, "2026-10-03T00:00:00Z")];
+    backend.note_markdown = () => "**T**\n";
+    renderIn(<PersonalView />);
+    fireEvent.click(await screen.findByRole("button", { name: "Copy note" }));
+    expect(await screen.findByText("Note copied")).toBeTruthy();
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("**T**\n");
+    expect(calls.find((c) => c.cmd === "note_markdown")?.args).toEqual({ request: { guid: "a" } });
+  });
 });
 
 describe("Note in the study pane", () => {

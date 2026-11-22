@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, NotebookPen, SquareArrowOutUpRight, Trash2 } from "lucide-react";
+import { ChevronDown, ChevronUp, Copy, NotebookPen, SquareArrowOutUpRight, Trash2 } from "lucide-react";
 import { useApp } from "@/app";
-import { api, type Note } from "@/lib/api";
+import { api, type MarkdownRequest, type Note } from "@/lib/api";
 import { fieldsOf, parseTags, sameFields, type NoteDraft, type NoteFields } from "@/lib/notes";
 import { renderMarkdown } from "@/lib/markdown";
 import { linkEdit, useLinkBible } from "@/lib/note-links";
@@ -86,6 +86,24 @@ function openNoteLink(a: HTMLAnchorElement, onAppLink: ((href: string) => void) 
   else api.openExternal(a.href).catch((e) => onError(String(e)));
 }
 
+/** Puts a note on the clipboard as Markdown. */
+export async function copyNoteMarkdown(request: MarkdownRequest) {
+  await navigator.clipboard.writeText(await api.noteMarkdown(request));
+}
+
+/** Copies a saved note as Markdown by its guid, and tells how that went. */
+export function useCopyNote() {
+  const { toast } = useApp();
+  return async (guid: string) => {
+    try {
+      await copyNoteMarkdown({ guid });
+      toast(t("Note copied"));
+    } catch (e) {
+      toast(t("Copy failed: {error}", { error: String(e) }));
+    }
+  };
+}
+
 /**
  * A note as shown in the study pane and in Personal Study. With `onToggle`, a
  * note cut off at four lines can be opened to its whole text, links and all.
@@ -96,6 +114,7 @@ export function NoteCard({
   subtitle,
   expanded = false,
   onToggle,
+  onCopy,
   onAppLink,
 }: {
   note: Note;
@@ -103,6 +122,8 @@ export function NoteCard({
   subtitle?: string;
   expanded?: boolean;
   onToggle?: () => void;
+  /** Copies the note as Markdown; without it the card offers no copy. */
+  onCopy?: () => void;
   /** Opens the app's own links, such as a Bible verse; without it the main window opens them. */
   onAppLink?: (href: string) => void;
 }) {
@@ -150,7 +171,12 @@ export function NoteCard({
       {note.title && <div className="font-semibold">{note.title}</div>}
     </>
   );
-  const frame = cn("flex w-full gap-3 rounded-md border border-line p-3 text-left hover:bg-bar", toggle && "pr-9");
+  const buttons = (toggle ? 1 : 0) + (onCopy ? 1 : 0);
+  const frame = cn(
+    "flex w-full gap-3 rounded-md border border-line p-3 text-left hover:bg-bar",
+    buttons === 1 && "pr-9",
+    buttons === 2 && "pr-16",
+  );
   const card = expanded ? (
     // A button cannot hold links, so the whole note is a plain block; the title stays the button.
     <div className={frame}>
@@ -185,22 +211,38 @@ export function NoteCard({
       </div>
     </button>
   );
-  if (!onToggle) return card;
+  if (!onToggle && !onCopy) return card;
   const label = expanded ? t("Show less") : t("Show whole note");
+  // Outside the card's button, which cannot hold another; a click here is not a request to edit.
   return (
     <div className="relative">
       {card}
-      {toggle && (
-        <button
-          title={label}
-          aria-label={label}
-          aria-expanded={expanded}
-          onClick={onToggle}
-          className="absolute right-2 top-2 p-1 text-muted hover:text-accent"
-        >
-          {expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-        </button>
-      )}
+      <div className="absolute right-2 top-2 flex gap-1">
+        {onCopy && (
+          <button
+            title={t("Copy note")}
+            aria-label={t("Copy note")}
+            onClick={(e) => {
+              e.stopPropagation();
+              onCopy();
+            }}
+            className="p-1 text-muted hover:text-accent"
+          >
+            <Copy size={16} />
+          </button>
+        )}
+        {toggle && (
+          <button
+            title={label}
+            aria-label={label}
+            aria-expanded={expanded}
+            onClick={onToggle}
+            className="p-1 text-muted hover:text-accent"
+          >
+            {expanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -217,6 +259,15 @@ export const saveDraft = (draft: NoteDraft, input: NoteSaveInput) =>
     markGuid: draft.markGuid ?? null,
   });
 
+/** What to copy for a draft, with its text as typed: a saved note by its guid, a new one by its page and block. */
+export const requestFor = (draft: NoteDraft, input: NoteSaveInput): MarkdownRequest => ({
+  guid: draft.note.guid ?? null,
+  target: draft.note.guid ? null : (draft.target ?? null),
+  blockType: draft.blockType ?? 0,
+  blockIdentifier: draft.blockIdentifier ?? null,
+  text: input,
+});
+
 /** The fields of a note and its buttons, shared by the study pane's editor and the note window. */
 export function NoteForm({
   note,
@@ -225,6 +276,7 @@ export function NoteForm({
   disabled = false,
   onSave,
   onDelete,
+  onCopy,
   onCancel,
   onDirty,
   onChange,
@@ -241,6 +293,8 @@ export function NoteForm({
   disabled?: boolean;
   onSave: (input: NoteSaveInput) => void;
   onDelete?: () => void;
+  /** Copies the fields as typed as Markdown; without it the form offers no copy. */
+  onCopy?: (input: NoteSaveInput) => Promise<void>;
   onCancel: () => void;
   /** Called with whether the fields differ from the note as opened. */
   onDirty?: (dirty: boolean) => void;
@@ -258,6 +312,7 @@ export function NoteForm({
   const [content, setContent] = useState(start.content);
   const [tags, setTags] = useState(start.tags);
   const [preview, setPreview] = useState(false);
+  const [copied, setCopied] = useState(false);
   const titleRef = useRef<HTMLInputElement>(null);
   const contentRef = useRef<HTMLTextAreaElement>(null);
   /** Where the caret goes once a link set without the browser's editing is shown. */
@@ -267,6 +322,17 @@ export function NoteForm({
     contentRef.current?.setSelectionRange(caret.current, caret.current);
     caret.current = null;
   }, [content]);
+  useEffect(() => {
+    if (!copied) return;
+    const timer = setTimeout(() => setCopied(false), 2000);
+    return () => clearTimeout(timer);
+  }, [copied]);
+  const empty = !title.trim() && !content.trim();
+  const input = (): NoteSaveInput => ({ title: title.trim(), content, tags: parseTags(tags) });
+  const copy = () =>
+    onCopy?.(input())
+      .then(() => setCopied(true))
+      .catch((e) => onError?.(String(e)));
   const dirty = !sameFields({ title, content, tags }, fieldsOf(note));
   useEffect(() => onDirty?.(dirty), [dirty, onDirty]);
   useEffect(() => onChange?.({ title, content, tags }), [title, content, tags, onChange]);
@@ -371,14 +437,16 @@ export function NoteForm({
             <Trash2 size={16} /> {t("Delete")}
           </Button>
         )}
+        {onCopy && (
+          <Button variant="ghost" disabled={empty} onClick={() => void copy()}>
+            <Copy size={16} /> {copied ? t("Copied") : t("Copy")}
+          </Button>
+        )}
         <span className="flex-1" />
         <Button variant="ghost" onClick={onCancel}>
           {t("Cancel")}
         </Button>
-        <Button
-          disabled={!title.trim() && !content.trim()}
-          onClick={() => onSave({ title: title.trim(), content, tags: parseTags(tags) })}
-        >
+        <Button disabled={empty} onClick={() => onSave(input())}>
           {t("Save")}
         </Button>
       </div>
@@ -458,6 +526,7 @@ export function InlineNoteEditor({ onAppLink }: { onAppLink?: (href: string) => 
         books={bible?.books}
         onCancel={() => void closeNote(id)}
         onSave={(input) => run(() => saveDraft(draft, input))}
+        onCopy={(input) => copyNoteMarkdown(requestFor(draft, input))}
         onDelete={draft.note.guid ? () => run(() => api.deleteNote(draft.note.guid!)) : undefined}
       />
     </section>

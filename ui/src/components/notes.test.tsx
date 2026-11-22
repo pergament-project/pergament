@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => undefined), convertFileSrc: (p: string) => p }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => () => undefined), emitTo: vi.fn(async () => undefined) }));
@@ -11,7 +11,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({ ask: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
 import { emitTo } from "@tauri-apps/api/event";
-import { NoteCard, NoteForm } from "./notes";
+import { NoteCard, NoteForm, requestFor } from "./notes";
 import type { Note } from "@/lib/api";
 
 const note: Note = {
@@ -298,5 +298,57 @@ describe("NoteForm", () => {
     area.setSelectionRange(0, 1);
     fireEvent.keyDown(area, { key: "L", ctrlKey: true, shiftKey: true });
     expect(area.value).toBe("x");
+  });
+});
+
+describe("Copying a note", () => {
+  it("copies a card without editing it, and offers no copy without onCopy", () => {
+    const onClick = vi.fn();
+    const onCopy = vi.fn();
+    render(<NoteCard note={note} onClick={onClick} onCopy={onCopy} />);
+    fireEvent.click(screen.getByRole("button", { name: "Copy note" }));
+    expect(onCopy).toHaveBeenCalledTimes(1);
+    expect(onClick).not.toHaveBeenCalled();
+    cleanup();
+    render(<NoteCard note={note} onClick={onClick} />);
+    expect(screen.queryByRole("button", { name: "Copy note" })).toBeNull();
+  });
+
+  it("copies the fields as typed and says so", async () => {
+    const onCopy = vi.fn(async () => undefined);
+    render(
+      <NoteForm note={{ content: "Body" }} focus={false} onSave={() => undefined} onCancel={() => undefined} onCopy={onCopy} />,
+    );
+    fireEvent.change(screen.getByPlaceholderText("Title"), { target: { value: " Fresh " } });
+    fireEvent.change(screen.getByPlaceholderText("Tags, separated by commas"), { target: { value: "a, b" } });
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    expect(onCopy).toHaveBeenCalledWith({ title: "Fresh", content: "Body", tags: ["a", "b"] });
+    await waitFor(() => expect(screen.getByRole("button", { name: "Copied" })).toBeTruthy());
+  });
+
+  it("cannot copy an empty form", () => {
+    render(
+      <NoteForm note={{}} focus={false} onSave={() => undefined} onCancel={() => undefined} onCopy={async () => undefined} />,
+    );
+    expect((screen.getByRole("button", { name: "Copy" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("asks for a saved note by its guid and a new one by its page", () => {
+    const text = { title: "T", content: "", tags: [] };
+    const target = { publication: { symbol: "nwtsty", language: "X" }, documentId: 1 } as never;
+    expect(requestFor({ note: { guid: "a" }, target }, text)).toEqual({
+      guid: "a",
+      target: null,
+      blockType: 0,
+      blockIdentifier: null,
+      text,
+    });
+    expect(requestFor({ note: {}, target, blockType: 2, blockIdentifier: 7 }, text)).toEqual({
+      guid: null,
+      target,
+      blockType: 2,
+      blockIdentifier: 7,
+      text,
+    });
   });
 });

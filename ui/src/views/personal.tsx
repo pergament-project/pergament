@@ -3,7 +3,7 @@ import { Bookmark as BookmarkIcon, DatabaseBackup, FolderOpen, Pencil, Plus, Tag
 import { AppBar, SectionTitle, useApp } from "@/app";
 import { api, type Bookmark, type Loc, type Note, type TagInfo, type UserDataSummary } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import { InlineNoteEditor, NoteCard } from "@/components/notes";
+import { InlineNoteEditor, NoteCard, useCopyNote } from "@/components/notes";
 import { ReadingPlansSection } from "@/components/reading-plans";
 import { Input } from "@/components/ui/input";
 import { HIGHLIGHT_COLORS } from "@/lib/marks";
@@ -24,6 +24,7 @@ let cachedLoad: Loaded | undefined;
 
 export function PersonalView() {
   const { push, toast, userVersion, notesVersion, createBackup, restoreBackup, mergeBackups, openNote, note, releaseNote, view, replace } = useApp();
+  const copyNote = useCopyNote();
   const [summary, setSummary] = useState<UserDataSummary | null>(cachedLoad?.summary ?? null);
   const [tags, setTags] = useState<TagInfo[]>(cachedLoad?.tags ?? []);
   const [tag, setTag] = useState<number | null>(null);
@@ -177,6 +178,7 @@ export function PersonalView() {
                       note={n}
                       subtitle={n.location?.title ?? undefined}
                       onClick={n.location ? () => void open(n.location!, n.guid) : () => edit(n)}
+                      onCopy={() => void copyNote(n.guid)}
                     />
                   </div>
                   <button
