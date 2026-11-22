@@ -1,5 +1,7 @@
 //! Notes as Markdown: the text of one note, as copied or exported.
 
+use std::collections::{HashMap, HashSet};
+
 use lol_html::{element, rewrite_str, RewriteStrSettings};
 use serde::Serialize;
 
@@ -200,6 +202,54 @@ pub fn body(title: &str, content: &str, tags: &[String], anchor: &Anchor) -> Str
     blocks.join("\n\n") + "\n"
 }
 
+/// The publications user data refers to, each opened at most once.
+pub struct Publications<'a> {
+    library: &'a Library,
+    /// By (key symbol, language, issue), `None` when not downloaded.
+    found: HashMap<(String, i64, i64), Option<Publication>>,
+}
+
+impl<'a> Publications<'a> {
+    /// Opens the publications `locs` refer to, as [`Publication::find`] picks them.
+    pub fn open<'l>(library: &'a Library, locs: impl IntoIterator<Item = &'l Loc>) -> Result<Self> {
+        let mut found: HashMap<(String, i64, i64), Option<Publication>> = locs
+            .into_iter()
+            .map(|l| ((l.key_symbol.clone(), l.meps_language, l.issue_tag), None))
+            .collect();
+        let languages: HashSet<i64> = found.keys().map(|k| k.1).collect();
+        let mut missing = found.len();
+        for entry in library.list()? {
+            if missing == 0 {
+                break;
+            }
+            if !languages.contains(&entry.meps_language) {
+                continue;
+            }
+            let publication = Publication::open(library, &entry)?;
+            let key = (
+                publication.key_symbol()?,
+                entry.meps_language,
+                entry.issue_tag.parse::<i64>().unwrap_or(0),
+            );
+            if let Some(slot @ None) = found.get_mut(&key) {
+                *slot = Some(publication);
+                missing -= 1;
+            }
+        }
+        Ok(Self { library, found })
+    }
+
+    /// The publication `loc` refers to; one not given to [`Publications::open`] is looked up now.
+    pub fn get(&mut self, loc: &Loc) -> Result<Option<&Publication>> {
+        let key = (loc.key_symbol.clone(), loc.meps_language, loc.issue_tag);
+        if !self.found.contains_key(&key) {
+            let publication = Publication::find(self.library, &key.0, key.1, key.2)?;
+            self.found.insert(key.clone(), publication);
+        }
+        Ok(self.found[&key].as_ref())
+    }
+}
+
 /// The quote and reference of a note at `loc`, or of none; `location_title` is the stored `Location.Title`.
 pub fn resolve(
     library: &Library,
@@ -208,17 +258,33 @@ pub fn resolve(
     block_type: i64,
     block_identifier: Option<i64>,
 ) -> Result<Anchor> {
+    resolve_in(
+        &mut Publications::open(library, loc)?,
+        loc,
+        location_title,
+        block_type,
+        block_identifier,
+    )
+}
+
+/// [`resolve`] with the publications of `publications`.
+pub fn resolve_in(
+    publications: &mut Publications,
+    loc: Option<&Loc>,
+    location_title: Option<&str>,
+    block_type: i64,
+    block_identifier: Option<i64>,
+) -> Result<Anchor> {
     let Some(loc) = loc else {
         return Ok(Anchor::default());
     };
-    let found = match Publication::find(library, &loc.key_symbol, loc.meps_language, loc.issue_tag)?
-    {
+    let found = match publications.get(loc)? {
         Some(publication) => match (loc.book, loc.chapter, loc.document_id) {
             (Some(book), Some(chapter), _) if publication.is_bible() => {
-                bible_anchor(&publication, book, chapter, block_type, block_identifier)?
+                bible_anchor(publication, book, chapter, block_type, block_identifier)?
             }
             (_, _, Some(meps_id)) => {
-                document_anchor(&publication, meps_id, block_type, block_identifier)?
+                document_anchor(publication, meps_id, block_type, block_identifier)?
             }
             _ => None,
         },
@@ -232,9 +298,15 @@ pub fn resolve(
 
 /// `resolve` for a stored note, then `body`.
 pub fn note_body(library: &Library, note: &Note) -> Result<(String, Anchor)> {
+    let loc = note.location.as_ref().map(|l| &l.loc);
+    note_body_in(&mut Publications::open(library, loc)?, note)
+}
+
+/// [`note_body`] with the publications of `publications`.
+pub fn note_body_in(publications: &mut Publications, note: &Note) -> Result<(String, Anchor)> {
     let location = note.location.as_ref();
-    let anchor = resolve(
-        library,
+    let anchor = resolve_in(
+        publications,
         location.map(|l| &l.loc),
         location.and_then(|l| l.title.as_deref()),
         note.block_type,

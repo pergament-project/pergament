@@ -16,6 +16,7 @@ pub mod manifest;
 pub mod mediator;
 pub mod navigate;
 pub mod net;
+pub mod note_export;
 pub mod note_markdown;
 pub mod reader;
 pub mod reading_plans;
