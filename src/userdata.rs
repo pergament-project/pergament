@@ -4580,6 +4580,83 @@ mod tests {
         assert_eq!((location, mark), (None, None));
     }
 
+    /// Checks a note has no page and no highlight, in the API and in the database.
+    fn assert_free_standing(ud: &UserData, guid: &str, title: &str, content: &str, tags: &[&str]) {
+        let n = note(ud, guid);
+        assert!(n.location.is_none());
+        assert!(n.mark_guid.is_none());
+        assert_eq!((n.block_type, n.block_identifier), (0, None));
+        assert_eq!((n.title.as_str(), n.content.as_str()), (title, content));
+        assert_eq!(n.tags, tags);
+        let row: (Option<i64>, Option<i64>, i64) = ud
+            .conn
+            .query_row(
+                "SELECT LocationId, UserMarkId, BlockType FROM Note WHERE Guid = ?1",
+                [guid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, 0));
+    }
+
+    #[test]
+    fn free_standing_note_survives_backup_and_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ud = UserData::open(tmp.path().join("a").join(DB_NAME)).unwrap();
+        let guid = ud
+            .save_note(
+                None,
+                None,
+                &note_input("Free", "loose thought", &["study", "ideas"]),
+            )
+            .unwrap();
+        let file = backup_of(&ud, tmp.path(), "free.jwlibrary");
+        let mut other = UserData::open(tmp.path().join("b").join(DB_NAME)).unwrap();
+        other.restore_backup(&file).unwrap();
+        assert_free_standing(&other, &guid, "Free", "loose thought", &["ideas", "study"]);
+        assert_eq!(count(&other, "Location"), 0);
+        assert_foreign_keys_hold(&other);
+    }
+
+    #[test]
+    fn merge_adds_free_standing_note_and_takes_the_newer_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut local = UserData::open(tmp.path().join("l").join(DB_NAME)).unwrap();
+        local
+            .save_note(Some(&bible(1)), None, &note_input("Anchored", "a", &[]))
+            .unwrap();
+        let mut remote = UserData::open(tmp.path().join("r").join(DB_NAME)).unwrap();
+        let guid = remote
+            .save_note(None, None, &note_input("Free", "first", &["Remote"]))
+            .unwrap();
+        let r = local
+            .merge_backup(&backup_of(&remote, tmp.path(), "r1.jwlibrary"))
+            .unwrap();
+        assert_eq!(r.added, 1);
+        assert_free_standing(&local, &guid, "Free", "first", &["Remote"]);
+
+        // Edited on both sides: the newer note wins and stays free-standing.
+        edit_note(&mut remote, &guid, "Free", "newer", &["Remote"]);
+        set_note_time(&remote, &guid, "2030-01-01T00:00:00Z");
+        edit_note(&mut local, &guid, "Free", "older", &["Local"]);
+        set_note_time(&local, &guid, "2020-01-01T00:00:00Z");
+        let r = local
+            .merge_backup(&backup_of(&remote, tmp.path(), "r2.jwlibrary"))
+            .unwrap();
+        assert_eq!((r.added, r.updated), (0, 1));
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+        assert_free_standing(&local, &guid, "Free", "newer", &["Remote"]);
+        assert_eq!(count(&local, "Note"), 2);
+        assert_foreign_keys_hold(&local);
+
+        // Merging the same file again changes nothing.
+        let r = local
+            .merge_backup(&backup_of(&remote, tmp.path(), "r3.jwlibrary"))
+            .unwrap();
+        assert_eq!((r.added, r.updated), (0, 0));
+        assert_eq!(count(&local, "Note"), 2);
+    }
+
     fn note_input(title: &str, content: &str, tags: &[&str]) -> NoteInput {
         NoteInput {
             title: title.into(),
@@ -6512,6 +6589,33 @@ mod tests {
             assert_eq!(note(&a.ud, &attached).tags, vec!["t"]);
             assert_foreign_keys_hold(&a.ud);
             assert_eq!(a.ud.snapshot().unwrap(), b.ud.snapshot().unwrap());
+        }
+
+        #[test]
+        fn sync_carries_free_standing_notes_both_ways() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let guid =
+                a.ud.save_note(None, None, &note_input("Free", "on a", &["t"]))
+                    .unwrap();
+            sync_both(&mut a, &mut b);
+            assert_free_standing(&b.ud, &guid, "Free", "on a", &["t"]);
+
+            // Edited on B only: A takes the edit.
+            edit_note(&mut b.ud, &guid, "Free", "edited on b", &["t", "u"]);
+            let r = sync(&b, &mut a);
+            assert!(r.report.conflicts.is_empty(), "{:?}", r.report.conflicts);
+            assert_free_standing(&a.ud, &guid, "Free", "edited on b", &["t", "u"]);
+
+            // Deleted on A: B deletes it too.
+            sync(&a, &mut b);
+            a.ud.delete_note(&guid).unwrap();
+            let r = merged(try_sync(&a, &mut b, DeleteGuard::Apply));
+            // The note and its two tag links.
+            assert_eq!(r.deleted, 3);
+            assert!(!has_note(&b.ud, &guid));
+            assert_eq!(count(&b.ud, "TagMap"), 0);
+            assert_foreign_keys_hold(&b.ud);
         }
 
         #[test]
