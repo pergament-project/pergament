@@ -159,6 +159,7 @@ pub struct Note {
     pub color: Option<i64>,
     pub tags: Vec<String>,
     pub last_modified: String,
+    pub created: String,
     pub location: Option<NoteLocation>,
 }
 
@@ -740,7 +741,7 @@ impl UserData {
     const NOTE_SELECT: &str = "SELECT n.NoteId, n.Guid, IFNULL(n.Title, ''), IFNULL(n.Content, ''),
             n.BlockType, n.BlockIdentifier, m.UserMarkGuid, m.ColorIndex, n.LastModified,
             l.KeySymbol, l.MepsLanguage, l.IssueTagNumber, l.DocumentId, l.BookNumber,
-            l.ChapterNumber, l.Title
+            l.ChapterNumber, l.Title, IFNULL(n.Created, n.LastModified)
          FROM Note n
          LEFT JOIN UserMark m ON m.UserMarkId = n.UserMarkId
          LEFT JOIN Location l ON l.LocationId = n.LocationId";
@@ -780,6 +781,7 @@ impl UserData {
                     color: r.get(7)?,
                     tags: Vec::new(),
                     last_modified: r.get(8)?,
+                    created: r.get(16)?,
                     location,
                 },
             ))
@@ -809,6 +811,11 @@ impl UserData {
             out.extend(self.notes_where("WHERE n.LocationId = ?1", &[&location])?);
         }
         Ok(out)
+    }
+
+    /// The note with `guid`, if any.
+    pub fn note(&self, guid: &str) -> Result<Option<Note>> {
+        Ok(self.notes_where("WHERE n.Guid = ?1", &[&guid])?.pop())
     }
 
     /// All notes, newest first, optionally only those with tag `tag`.
@@ -4680,6 +4687,19 @@ mod tests {
             .into_iter()
             .find(|n| n.guid == guid)
             .unwrap()
+    }
+
+    #[test]
+    fn note_by_guid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ud = UserData::open(tmp.path().join(DB_NAME)).unwrap();
+        let guid = ud
+            .save_note(Some(&bible(1)), None, &note_input("T", "body", &[]))
+            .unwrap();
+        let found = ud.note(&guid).unwrap().unwrap();
+        assert_eq!(found.guid, guid);
+        assert!(!found.created.is_empty());
+        assert!(ud.note("missing").unwrap().is_none());
     }
 
     fn assert_foreign_keys_hold(ud: &UserData) {

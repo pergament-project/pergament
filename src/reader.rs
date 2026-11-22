@@ -115,6 +115,27 @@ impl Publication {
         })
     }
 
+    /// The downloaded publication user data refers to by key symbol, language and issue.
+    pub fn find(
+        library: &Library,
+        key_symbol: &str,
+        meps_language: i64,
+        issue_tag: i64,
+    ) -> Result<Option<Publication>> {
+        for entry in library.list()? {
+            if entry.meps_language != meps_language {
+                continue;
+            }
+            let publication = Publication::open(library, &entry)?;
+            if publication.key_symbol()? == key_symbol
+                && entry.issue_tag.parse::<i64>().unwrap_or(0) == issue_tag
+            {
+                return Ok(Some(publication));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn entry(&self) -> &Entry {
         &self.entry
     }

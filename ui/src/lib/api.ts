@@ -309,6 +309,7 @@ export interface Note {
   color: number | null;
   tags: string[];
   lastModified: string;
+  created: string;
   location: (Loc & { title: string | null }) | null;
 }
 

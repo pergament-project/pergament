@@ -53,6 +53,7 @@ const note: Note = {
   color: 1,
   tags: [],
   lastModified: "2026-10-03T00:00:00Z",
+  created: "2026-10-03T00:00:00Z",
   location: null,
 };
 

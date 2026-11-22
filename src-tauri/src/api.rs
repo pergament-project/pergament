@@ -929,36 +929,32 @@ pub fn page_user_data(
 
 /// Where to open a note's or bookmark's page, if its publication is downloaded.
 pub fn open_location(library: &Library, loc: &Loc) -> ApiResult<Option<Target>> {
-    for entry in library.list().map_err(err)? {
-        if entry.meps_language != loc.meps_language {
-            continue;
-        }
-        let publication = Publication::open(library, &entry).map_err(err)?;
-        if publication.key_symbol().map_err(err)? != loc.key_symbol
-            || entry.issue_tag.parse::<i64>().unwrap_or(0) != loc.issue_tag
-        {
-            continue;
-        }
-        if let (Some(book), Some(chapter)) = (loc.book, loc.chapter)
-            && publication.is_bible()
-        {
-            return Ok(Some(Target {
-                publication: entry.dir_name,
-                kind: TargetKind::Chapter {
-                    book,
-                    chapter,
-                    verse: 1,
-                },
-            }));
-        }
-        if let Some(meps) = loc.document_id
-            && let Some(id) = publication.document_by_meps_id(meps).map_err(err)?
-        {
-            return Ok(Some(Target {
-                publication: entry.dir_name,
-                kind: TargetKind::Document(id),
-            }));
-        }
+    let Some(publication) =
+        Publication::find(library, &loc.key_symbol, loc.meps_language, loc.issue_tag)
+            .map_err(err)?
+    else {
+        return Ok(None);
+    };
+    let dir_name = publication.entry().dir_name.clone();
+    if let (Some(book), Some(chapter)) = (loc.book, loc.chapter)
+        && publication.is_bible()
+    {
+        return Ok(Some(Target {
+            publication: dir_name,
+            kind: TargetKind::Chapter {
+                book,
+                chapter,
+                verse: 1,
+            },
+        }));
+    }
+    if let Some(meps) = loc.document_id
+        && let Some(id) = publication.document_by_meps_id(meps).map_err(err)?
+    {
+        return Ok(Some(Target {
+            publication: dir_name,
+            kind: TargetKind::Document(id),
+        }));
     }
     Ok(None)
 }

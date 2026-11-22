@@ -324,7 +324,7 @@ describe("Settings cache", () => {
 
 describe("Personal Study", () => {
   const note = (guid: string, title: string, color: number | null, lastModified: string) => ({
-    guid, title, content: "", blockType: 0, blockIdentifier: null, markGuid: null, color, tags: [], lastModified, location: null,
+    guid, title, content: "", blockType: 0, blockIdentifier: null, markGuid: null, color, tags: [], lastModified, created: lastModified, location: null,
   });
 
   it("narrows the notes by text and highlight color and changes their order", async () => {
@@ -520,7 +520,7 @@ describe("Note in the study pane", () => {
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [
-      { guid: "a", title: "Loose thought", content: "", blockType: 0, blockIdentifier: null, markGuid: null, color: null, tags: [], lastModified: "2026-10-03T00:00:00Z", location: null },
+      { guid: "a", title: "Loose thought", content: "", blockType: 0, blockIdentifier: null, markGuid: null, color: null, tags: [], lastModified: "2026-10-03T00:00:00Z", created: "2026-10-03T00:00:00Z", location: null },
     ];
     renderIn(<PersonalView />);
     fireEvent.click(await screen.findByRole("button", { name: "Edit note" }));
@@ -1208,7 +1208,7 @@ describe("Coming back to a page", () => {
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [
-      { guid: "a", title: "Dusk visits", content: "", blockType: 0, blockIdentifier: null, markGuid: null, color: null, tags: [], lastModified: "2026-10-03T00:00:00Z", location: null },
+      { guid: "a", title: "Dusk visits", content: "", blockType: 0, blockIdentifier: null, markGuid: null, color: null, tags: [], lastModified: "2026-10-03T00:00:00Z", created: "2026-10-03T00:00:00Z", location: null },
     ];
     const first = renderIn(<PersonalView />);
     await screen.findByText("Dusk visits");
