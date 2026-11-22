@@ -505,3 +505,33 @@ fn verse_table_matches_the_study_bible() {
         }
     }
 }
+
+/// A note on John 3:16 quotes the verse without its number.
+#[test]
+fn note_anchor_resolves_john_3_16() {
+    let Some((_tmp, lib, entry)) = open_library("PERGAMENT_TEST_JWPUB") else {
+        return;
+    };
+    let p = pergament::Publication::open(&lib, &entry).unwrap();
+    let loc = pergament::userdata::Loc {
+        key_symbol: p.key_symbol().unwrap(),
+        meps_language: entry.meps_language,
+        issue_tag: 0,
+        document_id: None,
+        book: Some(43),
+        chapter: Some(3),
+    };
+    let anchor = pergament::note_markdown::resolve(
+        &lib,
+        Some(&loc),
+        None,
+        pergament::userdata::BLOCK_VERSE,
+        Some(16),
+    )
+    .unwrap();
+    let quote = anchor.quote.unwrap();
+    assert!(!quote.is_empty());
+    assert!(!quote.starts_with("16"), "{quote}");
+    let reference = anchor.reference.unwrap();
+    assert!(reference.ends_with("3:16"), "{reference}");
+}

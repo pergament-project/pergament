@@ -1,6 +1,13 @@
 //! Notes as Markdown: the text of one note, as copied or exported.
 
+use lol_html::{RewriteStrSettings, element, rewrite_str};
 use serde::Serialize;
+
+use crate::reader::VerseRef;
+use crate::render::reference_label;
+use crate::search_index::{IndexedBlock, extract_chapter_blocks, extract_document_blocks};
+use crate::userdata::{BLOCK_PARAGRAPH, BLOCK_VERSE, Loc, Note};
+use crate::{Error, Library, Publication, Result};
 
 /// What a note quotes and where it belongs, resolved from its anchor.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
@@ -189,6 +196,178 @@ pub fn body(title: &str, content: &str, tags: &[String], anchor: &Anchor) -> Str
     blocks.join("\n\n") + "\n"
 }
 
+/// The quote and reference of a note at `loc`, or of none; `location_title` is the stored `Location.Title`.
+pub fn resolve(
+    library: &Library,
+    loc: Option<&Loc>,
+    location_title: Option<&str>,
+    block_type: i64,
+    block_identifier: Option<i64>,
+) -> Result<Anchor> {
+    let Some(loc) = loc else {
+        return Ok(Anchor::default());
+    };
+    let found = match Publication::find(library, &loc.key_symbol, loc.meps_language, loc.issue_tag)?
+    {
+        Some(publication) => match (loc.book, loc.chapter, loc.document_id) {
+            (Some(book), Some(chapter), _) if publication.is_bible() => {
+                bible_anchor(&publication, book, chapter, block_type, block_identifier)?
+            }
+            (_, _, Some(meps_id)) => {
+                document_anchor(&publication, meps_id, block_type, block_identifier)?
+            }
+            _ => None,
+        },
+        None => None,
+    };
+    Ok(found.unwrap_or_else(|| Anchor {
+        reference: Some(fallback_reference(loc, location_title)),
+        quote: None,
+    }))
+}
+
+/// `resolve` for a stored note, then `body`.
+pub fn note_body(library: &Library, note: &Note) -> Result<(String, Anchor)> {
+    let location = note.location.as_ref();
+    let anchor = resolve(
+        library,
+        location.map(|l| &l.loc),
+        location.and_then(|l| l.title.as_deref()),
+        note.block_type,
+        note.block_identifier,
+    )?;
+    Ok((
+        body(&note.title, &note.content, &note.tags, &anchor),
+        anchor,
+    ))
+}
+
+/// The reference of a location whose publication or document isn't available.
+fn fallback_reference(loc: &Loc, location_title: Option<&str>) -> String {
+    if let Some(title) = location_title.map(str::trim).filter(|t| !t.is_empty()) {
+        return title.to_string();
+    }
+    match (loc.book, loc.chapter) {
+        (Some(book), Some(chapter)) => format!("{} {book}:{chapter}", loc.key_symbol),
+        _ => loc.key_symbol.clone(),
+    }
+}
+
+/// `None` for a `NotFound` error, so the caller falls back.
+fn unless_missing<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(Error::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The text of the blocks `matches` picks, joined; `None` if there are none.
+fn block_text(
+    blocks: Vec<IndexedBlock>,
+    matches: impl Fn(&IndexedBlock) -> bool,
+) -> Option<String> {
+    let parts: Vec<String> = blocks.into_iter().filter(matches).map(|b| b.text).collect();
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// The anchor of a chapter or verse of a Bible; `None` if the book is missing.
+fn bible_anchor(
+    publication: &Publication,
+    book: i64,
+    chapter: i64,
+    block_type: i64,
+    block_identifier: Option<i64>,
+) -> Result<Option<Anchor>> {
+    let Some(info) = unless_missing(publication.bible_book(book))? else {
+        return Ok(None);
+    };
+    let name = info.title;
+    let verse = block_identifier.filter(|_| block_type == BLOCK_VERSE);
+    let Some(v) = verse else {
+        return Ok(Some(Anchor {
+            reference: Some(format!("{name} {chapter}")),
+            quote: None,
+        }));
+    };
+    let at = VerseRef {
+        book,
+        chapter,
+        verse: v,
+    };
+    let quote = match unless_missing(publication.chapter(book, chapter))? {
+        Some(content) => {
+            let blocks =
+                extract_chapter_blocks(&without_markers(&content.content)?, book, chapter)?.blocks;
+            block_text(blocks, |b| b.verse == Some(v))
+                .map(|text| strip_verse_number(&text, chapter, v))
+        }
+        None => None,
+    };
+    Ok(Some(Anchor {
+        reference: Some(reference_label(&name, &name, at, at)),
+        quote,
+    }))
+}
+
+/// `html` without footnote, cross-reference and verse number markers.
+fn without_markers(html: &str) -> Result<String> {
+    let settings = RewriteStrSettings::new().append_element_content_handler(element!(
+        "span.m, span.fn, a.fn, span.vl",
+        |el| {
+            el.remove();
+            Ok(())
+        }
+    ));
+    rewrite_str(html, settings).map_err(|error| Error::Decode(error.to_string()))
+}
+
+/// Verse text without its leading verse number (or chapter number, for verse 1).
+fn strip_verse_number(text: &str, chapter: i64, verse: i64) -> String {
+    let mut rest = text.trim_start();
+    if verse == 1 {
+        rest = rest.strip_prefix(&format!("{chapter} ")).unwrap_or(rest);
+    }
+    rest = rest.strip_prefix(&format!("{verse} ")).unwrap_or(rest);
+    rest.trim().to_string()
+}
+
+/// The anchor of a document or paragraph; `None` if the document is missing.
+fn document_anchor(
+    publication: &Publication,
+    meps_id: i64,
+    block_type: i64,
+    block_identifier: Option<i64>,
+) -> Result<Option<Anchor>> {
+    let Some(id) = publication.document_by_meps_id(meps_id)? else {
+        return Ok(None);
+    };
+    let Some((document, html)) = unless_missing(publication.document(id))? else {
+        return Ok(None);
+    };
+    let doc_title = document.title.trim();
+    let pub_title = publication.entry().title.trim();
+    let reference = match (doc_title.is_empty(), pub_title.is_empty()) {
+        (true, true) => return Ok(None),
+        (false, true) => doc_title.to_string(),
+        (true, false) => pub_title.to_string(),
+        (false, false) if doc_title == pub_title => doc_title.to_string(),
+        (false, false) => format!("{doc_title} — {pub_title}"),
+    };
+    let paragraph = block_identifier.filter(|_| block_type == BLOCK_PARAGRAPH);
+    let quote = match (paragraph, html) {
+        (Some(p), Some(html)) => block_text(
+            extract_document_blocks(&without_markers(&html)?, id)?.blocks,
+            |b| b.paragraph == Some(p),
+        ),
+        _ => None,
+    };
+    Ok(Some(Anchor {
+        reference: Some(reference),
+        quote,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,6 +484,14 @@ mod tests {
     #[test]
     fn multi_line_quote_is_prefixed() {
         assert_eq!(body("", "", &[], &anchor(None, Some("a\nb"))), "> a\n> b\n");
+    }
+
+    #[test]
+    fn verse_numbers_are_stripped() {
+        assert_eq!(strip_verse_number("16 For God", 3, 16), "For God");
+        assert_eq!(strip_verse_number("3 1 Now", 3, 1), "Now");
+        assert_eq!(strip_verse_number("3 Now", 3, 1), "Now");
+        assert_eq!(strip_verse_number("160 men", 3, 16), "160 men");
     }
 
     #[test]
