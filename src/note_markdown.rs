@@ -1,12 +1,12 @@
 //! Notes as Markdown: the text of one note, as copied or exported.
 
-use lol_html::{RewriteStrSettings, element, rewrite_str};
+use lol_html::{element, rewrite_str, RewriteStrSettings};
 use serde::Serialize;
 
 use crate::reader::VerseRef;
 use crate::render::reference_label;
-use crate::search_index::{IndexedBlock, extract_chapter_blocks, extract_document_blocks};
-use crate::userdata::{BLOCK_PARAGRAPH, BLOCK_VERSE, Loc, Note};
+use crate::search_index::{extract_chapter_blocks, extract_document_blocks, IndexedBlock};
+use crate::userdata::{Loc, Note, BLOCK_PARAGRAPH, BLOCK_VERSE};
 use crate::{Error, Library, Publication, Result};
 
 /// What a note quotes and where it belongs, resolved from its anchor.
@@ -106,7 +106,11 @@ pub fn utc_timestamp(ts: &str) -> Option<String> {
                 return None;
             }
             let minutes = h * 60 + m;
-            if *sign == b'-' { -minutes } else { minutes }
+            if *sign == b'-' {
+                -minutes
+            } else {
+                minutes
+            }
         }
         _ => return None,
     };
@@ -310,7 +314,7 @@ fn bible_anchor(
     }))
 }
 
-/// `html` without footnote, cross-reference and verse number markers.
+/// `html` without footnote, cross-reference and verse number markers (as nwtsty marks them).
 fn without_markers(html: &str) -> Result<String> {
     let settings = RewriteStrSettings::new().append_element_content_handler(element!(
         "span.m, span.fn, a.fn, span.vl",

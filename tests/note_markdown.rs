@@ -1,6 +1,8 @@
 mod common;
 
 use common::Fixture;
+use pergament::note_markdown::{resolve, Anchor};
+use pergament::userdata::{Loc, BLOCK_PARAGRAPH, BLOCK_VERSE};
 use pergament::{Library, Publication};
 
 #[test]
@@ -20,9 +22,6 @@ fn finds_a_publication_by_user_data_key() {
     assert!(Publication::find(&lib, "tst", 1, 0).unwrap().is_none());
     assert!(Publication::find(&lib, "xyz", 0, 0).unwrap().is_none());
 }
-
-use pergament::note_markdown::{Anchor, resolve};
-use pergament::userdata::{BLOCK_PARAGRAPH, BLOCK_VERSE, Loc};
 
 fn library(fixture: Fixture) -> (tempfile::TempDir, Library) {
     let tmp = tempfile::tempdir().unwrap();
