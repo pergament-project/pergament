@@ -195,9 +195,10 @@ impl SyncFolder {
             return Ok(false);
         }
         let part = self.dir.join(format!(".{}.part", self.own));
-        // The export flushes the file before the rename.
+        // The export flushes the file before the rename. Sync files never
+        // carry playlist media (docs/FORMAT.md, "Sync").
         let written = ud
-            .export_backup_as(&part, &format!("Pergament ({host})"))
+            .export_backup_with(&part, &format!("Pergament ({host})"), false)
             .and_then(|()| Ok(fs::rename(&part, &dest)?));
         if let Err(e) = written {
             let _ = fs::remove_file(&part);
@@ -532,6 +533,20 @@ mod tests {
         // Reloading the state from disk keeps what was stored.
         let loaded = SyncState::load(&a.folder.state_dir);
         assert_eq!(loaded, a.state);
+    }
+
+    #[test]
+    fn own_file_has_no_media() {
+        let (tmp, mut a, _b) = setup();
+        a.mark(1, 1);
+        let tag = a.ud.create_playlist("Fotos").unwrap();
+        let png = tmp.path().join("IMG_3019.png");
+        fs::write(&png, b"png").unwrap();
+        a.ud.add_file_item(tag, &png).unwrap();
+        assert!(a.write());
+        let file = fs::File::open(a.folder.dir.join(&a.folder.own)).unwrap();
+        let zip = zip::ZipArchive::new(file).unwrap();
+        assert_eq!(zip.len(), 3, "manifest, database and thumbnail only");
     }
 
     #[test]

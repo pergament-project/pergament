@@ -341,6 +341,15 @@ Checked against one backup made by JW Library on iOS (schema version 16,
 2026-10). The backup itself is personal and not committed. [own]
 
 - A ZIP with `manifest.json`, `userData.db` and `default_thumbnail.png`.
+- Playlist media: one entry per file a playlist item uses (its media or its
+  thumbnail), named by its `IndependentMedia.FilePath` and stored, not
+  deflated. Backups (manual and rolling) and `.jwlplaylist` files written
+  here carry them; a file missing on disk is left out and logged. A restore
+  copies the entries the restored database names into `playlist-media/`
+  after the database is swapped in, then removes the files only the
+  previous database named; a file that cannot be copied leaves its item
+  unavailable. Only names that are safe plain file names are read or
+  written. Folder sync files never carry media. [own]
 - `manifest.json`: `creationDate`, `version` (1), `name`, `type` (0) and
   `userDataBackup` {`lastModifiedDate`, `hash`, `databaseName`,
   `deviceName`, `schemaVersion`}. `PRAGMA user_version` of the database
@@ -471,7 +480,9 @@ behavior. [own]
 
 Folder sync merges another computer's file with the same steps, but
 three-way: against the *base*, a snapshot of that computer's file as it was
-at the last merge, kept in the app's data folder. [own]
+at the last merge, kept in the app's data folder. Sync files hold no
+playlist media entries; restore's media copying is not used for them.
+[own]
 
 - A snapshot holds every highlight (with its ranges), note, user tag,
   bookmark, answer field, note or location `TagMap` row, reading plan and
@@ -558,7 +569,8 @@ at the last merge, kept in the app's data folder. [own]
   deletions and local rows summed over all kinds. "Apply deletions" runs it
   as computed, after a rolling backup of the local data (written even when
   rolling backups are off); if that backup fails, the deletions wait and the
-  sync status shows the error. "Keep my data" runs it without deletions, and
+  sync status shows the error. Each rolling backup contains all playlist
+  media. "Keep my data" runs it without deletions, and
   the merged file still becomes the new base. That protects only this
   computer: the rows the other computer deleted stay deleted there, as this
   computer's own file now holds them unchanged against its base on the other

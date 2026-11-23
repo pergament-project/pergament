@@ -1667,8 +1667,21 @@ impl UserData {
         self.export_backup_as(dest, DEVICE_NAME)
     }
 
-    /// Like `export_backup`, with `device_name` in the manifest.
+    /// Like `export_backup`, with `device_name` in the manifest and the
+    /// playlist media files.
     pub fn export_backup_as(&self, dest: &Path, device_name: &str) -> Result<()> {
+        self.export_backup_with(dest, device_name, true)
+    }
+
+    /// Like `export_backup_as`. `media`: also write every referenced file
+    /// from playlist-media as a Stored zip entry named `FilePath`; files
+    /// missing here are left out.
+    pub fn export_backup_with(&self, dest: &Path, device_name: &str, media: bool) -> Result<()> {
+        let files = if media {
+            referenced_media(&self.conn)?
+        } else {
+            Vec::new()
+        };
         let dir = tempfile::tempdir()?;
         let copy = dir.path().join(DB_NAME);
         self.conn
@@ -1706,7 +1719,7 @@ impl UserData {
         };
 
         let partial = dest.with_extension("jwlibrary.part");
-        {
+        let write = || -> Result<()> {
             let mut zip = zip::ZipWriter::new(File::create(&partial)?);
             let options = SimpleFileOptions::default();
             zip.start_file(MANIFEST, options)?;
@@ -1715,16 +1728,47 @@ impl UserData {
             io::copy(&mut File::open(&copy)?, &mut zip)?;
             zip.start_file(THUMBNAIL, options)?;
             zip.write_all(THUMBNAIL_PNG)?;
+            write_media_entries(&mut zip, &self.playlist_media_dir(), &files, "backup")?;
             // On disk before it replaces an older file of the same name.
             zip.finish()?.sync_all()?;
-        }
-        fs::rename(&partial, dest)?;
-        Ok(())
+            fs::rename(&partial, dest)?;
+            Ok(())
+        };
+        write().inspect_err(|_| {
+            let _ = fs::remove_file(&partial);
+        })
     }
 
     /// Replace all data with the backup at `src`. The previous database is
-    /// kept next to it as `userData.db.before-restore`.
+    /// kept next to it as `userData.db.before-restore`. After the swap the
+    /// backup's playlist media are copied in, and the files only the
+    /// previous database used are removed; a file that cannot be copied
+    /// leaves its item unavailable.
     pub fn restore_backup(&mut self, src: &Path) -> Result<Summary> {
+        let old_media = referenced_media(&self.conn)?;
+        let summary = self.swap_in_backup(src)?;
+        match self.install_missing_media(src) {
+            Ok(missing) if !missing.is_empty() => {
+                eprintln!("restore: playlist media missing from the backup: {missing:?}");
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("could not copy the media of {}: {e}", src.display()),
+        }
+        match referenced_media(&self.conn) {
+            Ok(new_media) => {
+                let gone: Vec<String> = old_media
+                    .into_iter()
+                    .filter(|name| !new_media.contains(name))
+                    .collect();
+                remove_media_files(&self.playlist_media_dir(), &gone);
+            }
+            Err(e) => eprintln!("restore: could not read the restored playlist media: {e}"),
+        }
+        Ok(summary)
+    }
+
+    /// The database part of [`UserData::restore_backup`].
+    fn swap_in_backup(&mut self, src: &Path) -> Result<Summary> {
         let dir = self
             .path
             .parent()
@@ -1933,22 +1977,9 @@ impl UserData {
     /// never looked up and are not returned.
     pub(crate) fn install_missing_media(&self, zip_path: &Path) -> Result<Vec<String>> {
         let dir = self.playlist_media_dir();
-        let names: Vec<String> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT m.FilePath FROM IndependentMedia m
-                 WHERE m.IndependentMediaId IN
-                       (SELECT IndependentMediaId FROM PlaylistItemIndependentMediaMap)
-                    OR m.FilePath IN
-                       (SELECT ThumbnailFilePath FROM PlaylistItem
-                        WHERE ThumbnailFilePath IS NOT NULL)
-                 ORDER BY m.FilePath",
-            )?;
-            stmt.query_map([], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?
-        };
-        let missing: Vec<String> = names
+        let missing: Vec<String> = referenced_media(&self.conn)?
             .into_iter()
-            .filter(|name| safe_media_name(name) && !dir.join(name).is_file())
+            .filter(|name| !dir.join(name).is_file())
             .collect();
         if missing.is_empty() {
             return Ok(missing);
@@ -2023,23 +2054,7 @@ impl UserData {
             io::copy(&mut File::open(&db)?, &mut zip)?;
             zip.start_file(THUMBNAIL, options)?;
             zip.write_all(THUMBNAIL_PNG)?;
-            for file in &files {
-                let path = media.join(file);
-                let source = if safe_media_name(file) {
-                    File::open(&path).ok()
-                } else {
-                    None
-                };
-                let Some(mut source) = source else {
-                    eprintln!("playlist export: media file {file:?} is missing");
-                    continue;
-                };
-                let stored = SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Stored)
-                    .large_file(source.metadata()?.len() >= u64::from(u32::MAX));
-                zip.start_file(file.as_str(), stored)?;
-                io::copy(&mut source, &mut zip)?;
-            }
+            write_media_entries(&mut zip, &media, &files, "playlist export")?;
             // On disk before it replaces an older file of the same name.
             zip.finish()?.sync_all()?;
             fs::rename(&partial, dest)?;
@@ -2568,7 +2583,7 @@ fn copy_playlist(
     Ok(used)
 }
 
-fn has_table(tx: &Transaction<'_>, schema: &str, table: &str) -> Result<bool> {
+fn has_table(tx: &Connection, schema: &str, table: &str) -> Result<bool> {
     Ok(tx.query_row(
         &format!(
             "SELECT count(*) > 0 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?1"
@@ -4170,6 +4185,62 @@ fn remove_orphan_media(tx: &Transaction<'_>) -> Result<Vec<String>> {
     };
     tx.execute(&format!("DELETE {unused}"), [])?;
     Ok(names)
+}
+
+/// Every `IndependentMedia.FilePath` a playlist item uses, as media or as
+/// thumbnail, that is a safe file name; sorted. None without the playlist
+/// tables.
+fn referenced_media(conn: &Connection) -> Result<Vec<String>> {
+    for table in [
+        "IndependentMedia",
+        "PlaylistItem",
+        "PlaylistItemIndependentMediaMap",
+    ] {
+        if !has_table(conn, "main", table)? {
+            return Ok(Vec::new());
+        }
+    }
+    let mut stmt = conn.prepare(
+        "SELECT m.FilePath FROM IndependentMedia m
+         WHERE m.IndependentMediaId IN
+               (SELECT IndependentMediaId FROM PlaylistItemIndependentMediaMap)
+            OR m.FilePath IN
+               (SELECT ThumbnailFilePath FROM PlaylistItem
+                WHERE ThumbnailFilePath IS NOT NULL)
+         ORDER BY m.FilePath",
+    )?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.into_iter().filter(|n| safe_media_name(n)).collect())
+}
+
+/// Write the files `names` from the media directory `dir` into `zip` as
+/// Stored entries of the same name. Unsafe names and files missing here
+/// are left out and logged.
+fn write_media_entries(
+    zip: &mut zip::ZipWriter<File>,
+    dir: &Path,
+    names: &[String],
+    what: &str,
+) -> Result<()> {
+    for name in names {
+        let source = if safe_media_name(name) {
+            File::open(dir.join(name)).ok()
+        } else {
+            None
+        };
+        let Some(mut source) = source else {
+            eprintln!("{what}: media file {name:?} is missing");
+            continue;
+        };
+        let stored = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .large_file(source.metadata()?.len() >= u64::from(u32::MAX));
+        zip.start_file(name.as_str(), stored)?;
+        io::copy(&mut source, zip)?;
+    }
+    Ok(())
 }
 
 /// Remove the files `names` from the media directory `dir`, after the rows
@@ -8747,6 +8818,163 @@ mod tests {
                 .collect::<rusqlite::Result<_>>()
                 .unwrap();
             assert_eq!(markers, ["ok"]);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        /// A playlist in `ud` with one photo item holding `bytes`; returns
+        /// the item id and the photo's `FilePath`.
+        fn photo_item(ud: &mut UserData, bytes: &[u8]) -> (i64, String) {
+            let tag = ud.create_playlist("Fotos").unwrap();
+            let src = tempfile::tempdir().unwrap();
+            let png = src.path().join("IMG_3019.png");
+            fs::write(&png, bytes).unwrap();
+            let item = ud.add_file_item(tag, &png).unwrap();
+            let name = ud
+                .conn
+                .query_row("SELECT FilePath FROM IndependentMedia", [], |r| r.get(0))
+                .unwrap();
+            (item, name)
+        }
+
+        fn file_available(ud: &UserData) -> bool {
+            let tag = ud.playlists().unwrap()[0].id;
+            match &ud.playlist(tag).unwrap().items[0].source {
+                ItemSource::File { available, .. } => *available,
+                ItemSource::Library { .. } => panic!("not a file item"),
+            }
+        }
+
+        fn zip_names(path: &Path) -> Vec<String> {
+            let mut zip = ZipArchive::new(File::open(path).unwrap()).unwrap();
+            let mut names: Vec<String> = (0..zip.len())
+                .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[test]
+        fn backup_carries_media() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            let (item, photo) = photo_item(&mut source, b"\x89PNG photo");
+            source
+                .set_playlist_item_thumbnail(item, b"jpeg thumb")
+                .unwrap();
+            let thumb = thumbnail_of(&source, item).unwrap();
+            let backup = tmp.path().join("b.jwlibrary");
+            source.export_backup(&backup).unwrap();
+
+            let mut zip = ZipArchive::new(File::open(&backup).unwrap()).unwrap();
+            for (name, bytes) in [(&photo, &b"\x89PNG photo"[..]), (&thumb, b"jpeg thumb")] {
+                let mut entry = zip.by_name(name).unwrap();
+                assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).unwrap();
+                assert_eq!(buf, bytes, "{name}");
+            }
+
+            let mut ud = open(&tmp.path().join("c"));
+            ud.restore_backup(&backup).unwrap();
+            assert!(file_available(&ud));
+            let tag = ud.playlists().unwrap()[0].id;
+            assert_eq!(
+                ud.playlist(tag).unwrap().items[0].thumbnail,
+                Some(ud.playlist_media_dir().join(&thumb))
+            );
+            assert_eq!(
+                fs::read(ud.playlist_media_dir().join(&photo)).unwrap(),
+                b"\x89PNG photo"
+            );
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn backup_skips_missing_media() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            let (_, photo) = photo_item(&mut source, b"png");
+            fs::remove_file(source.playlist_media_dir().join(&photo)).unwrap();
+            let backup = tmp.path().join("b.jwlibrary");
+            source.export_backup(&backup).unwrap();
+            assert_eq!(zip_names(&backup), [THUMBNAIL, MANIFEST, DB_NAME]);
+        }
+
+        #[test]
+        fn restore_replaces_media() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut other = open(&tmp.path().join("b"));
+            let (_, y) = photo_item(&mut other, b"photo Y");
+            let backup = tmp.path().join("b.jwlibrary");
+            other.export_backup(&backup).unwrap();
+
+            let mut ud = open(&tmp.path().join("a"));
+            let (_, x) = photo_item(&mut ud, b"photo X");
+            let dir = ud.playlist_media_dir();
+            let z = "0F4D0C55-6E4B-4E39-9C0B-5E0D1A3B2C1D.png";
+            fs::write(dir.join(z), b"stray").unwrap();
+            ud.restore_backup(&backup).unwrap();
+            assert_eq!(fs::read(dir.join(&y)).unwrap(), b"photo Y");
+            assert!(!dir.join(&x).exists());
+            assert_eq!(fs::read(dir.join(z)).unwrap(), b"stray");
+            assert!(file_available(&ud));
+        }
+
+        #[test]
+        fn restore_keeps_old_media_on_failure() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(&tmp.path().join("a"));
+            let (_, x) = photo_item(&mut ud, b"photo X");
+            let bad = tmp.path().join("bad.jwlibrary");
+            // A valid SQLite file without the user data tables.
+            let db = tmp.path().join("bad.db");
+            Connection::open(&db)
+                .unwrap()
+                .execute_batch("CREATE TABLE Other (x)")
+                .unwrap();
+            assert!(check_database(&db).is_err());
+            {
+                let mut zip = zip::ZipWriter::new(File::create(&bad).unwrap());
+                zip.start_file(MANIFEST, SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(
+                    br#"{"creationDate":"x","version":1,"name":"x","type":0,"userDataBackup":
+                        {"lastModifiedDate":"x","hash":"x","databaseName":"userData.db",
+                         "deviceName":"x","schemaVersion":16}}"#,
+                )
+                .unwrap();
+                zip.start_file(DB_NAME, SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(&fs::read(&db).unwrap()).unwrap();
+                zip.start_file(&x, SimpleFileOptions::default()).unwrap();
+                zip.write_all(b"replaced").unwrap();
+                zip.finish().unwrap();
+            }
+            assert!(matches!(
+                ud.restore_backup(&bad),
+                Err(Error::InvalidDatabase { .. })
+            ));
+            assert_eq!(
+                fs::read(ud.playlist_media_dir().join(&x)).unwrap(),
+                b"photo X"
+            );
+            assert!(file_available(&ud));
+        }
+
+        #[test]
+        fn backup_without_media_flag() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            photo_item(&mut source, b"png");
+            let backup = tmp.path().join("b.jwlibrary");
+            source
+                .export_backup_with(&backup, DEVICE_NAME, false)
+                .unwrap();
+            assert_eq!(zip_names(&backup), [THUMBNAIL, MANIFEST, DB_NAME]);
+
+            let mut ud = open(&tmp.path().join("c"));
+            ud.restore_backup(&backup).unwrap();
+            assert!(!file_available(&ud));
             assert_foreign_keys_hold(&ud);
         }
     }
