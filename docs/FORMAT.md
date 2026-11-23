@@ -399,7 +399,8 @@ Checked against one backup made by JW Library on iOS (schema version 16,
   field's `<textarea>` or `<input>`, e.g. `tt47`, not the `id` of its
   `div.gen-field`; a checkbox's `Value` is `1` or `0`, a text line's the text,
   as in a JW Library backup with checked goals and dates from `lff`),
-  playlists and `IndependentMedia` (not used here yet).
+  playlists (`Tag` type 2 with `PlaylistItem` rows and their location,
+  media and marker maps) and the `IndependentMedia` files they use.
 - Bookmark slots belong to a publication-wide type-1 `Location`, for both
   Bibles and other publications. The target page remains a separate type-0
   location. JW Library databases reject type-0 locations without a document,
@@ -474,7 +475,20 @@ behavior. [own]
 - Deletions are not propagated by a manual merge: a row missing on one side
   stays, so an item deleted on one side comes back when the other side's
   backup is merged. Folder sync does pass them on (see "Sync").
-- Playlists and `IndependentMedia` are not merged.
+- Playlists are matched by name (`Tag` type 2). A playlist missing here is
+  added with its items; their `IndependentMedia` rows are matched by
+  `FilePath` and added when missing, and the files come from the backup's
+  media entries after the database is saved (a file that cannot be copied
+  is logged, the merge still succeeds). Two playlists with the same items,
+  compared as in the content hash, are left alone. Otherwise the newer
+  database's version wins: when that is the incoming one, the local items
+  are replaced by its items, and a manual merge then appends the local
+  file items whose media `FilePath` the incoming version lacks, so a file
+  added on this computer is not lost. When the local database is newer
+  (or the order is unknown), the local playlist stays and the incoming one
+  is reported as a conflict. `IndependentMedia` rows no item uses any more
+  are deleted with their files. A backup without the playlist tables
+  merges no playlists.
 
 #### Sync
 

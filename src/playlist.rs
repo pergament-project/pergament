@@ -151,8 +151,6 @@ pub(crate) struct MarkerContent {
 /// "inc"). An item with a location comes as that location, like in the
 /// playlist view; an item without a location or media is left out. The
 /// caller makes sure `schema` has the playlist tables (`inc` may lack them).
-// Read by the merge and the sync of playlists; until then only by tests.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn content(conn: &Connection, schema: &str, tag: i64) -> Result<Vec<ItemContent>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT i.PlaylistItemId, i.Label, i.StartTrimOffsetTicks, i.EndTrimOffsetTicks,
