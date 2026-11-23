@@ -12,6 +12,7 @@ const note = (guid: string, over: Partial<Note> = {}): Note => ({
   color: null,
   tags: [],
   lastModified: "2026-10-01T00:00:00Z",
+  created: "2026-10-01T00:00:00Z",
   location: null,
   ...over,
 });

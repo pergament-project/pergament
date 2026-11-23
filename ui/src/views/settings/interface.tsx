@@ -9,7 +9,7 @@ import {
   DropdownMenuRadioItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { Layout, Theme } from "@/lib/settings";
+import type { Layout, NoteOpen, Theme } from "@/lib/settings";
 import { t, uiLanguages } from "@/lib/i18n";
 import type { UiLangSetting } from "@/lib/i18n";
 
@@ -32,8 +32,13 @@ const layouts: { value: Layout; label: string }[] = [
   { value: "wide", label: "Full width" },
 ];
 
+const noteOpens: { value: NoteOpen; label: string }[] = [
+  { value: "page", label: "In the page" },
+  { value: "window", label: "In a separate window" },
+];
+
 export function InterfaceTab() {
-  const { uiLang, setUiLang, theme, setTheme, layout, setLayout } = useApp();
+  const { uiLang, setUiLang, theme, setTheme, layout, setLayout, noteOpen, setNoteOpen } = useApp();
   return (
     <div className="space-y-10">
       <section>
@@ -80,6 +85,20 @@ export function InterfaceTab() {
         </ToggleGroup>
         <p className="mt-2 max-w-xl text-sm text-muted">
           {t("A centered column is easier to read; full width uses the whole window for lists, covers and the reader.")}
+        </p>
+      </section>
+      <section>
+        <h2 className="mb-3 text-sm font-semibold">{t("Open notes")}</h2>
+        {/* A click on the chosen one would turn it off; one always stays chosen. */}
+        <ToggleGroup type="single" aria-label={t("Open notes")} value={noteOpen} onValueChange={(v) => v && setNoteOpen(v as NoteOpen)}>
+          {noteOpens.map((x) => (
+            <ToggleGroupItem key={x.value} value={x.value}>
+              {t(x.label)}
+            </ToggleGroupItem>
+          ))}
+        </ToggleGroup>
+        <p className="mt-2 max-w-xl text-sm text-muted">
+          {t("Notes open next to the text they belong to, or in a window of their own that stays open while you read on.")}
         </p>
       </section>
     </div>

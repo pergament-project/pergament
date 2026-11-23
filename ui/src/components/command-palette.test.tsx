@@ -4,7 +4,9 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import type { PlanSchedule, PubCard, ReadingPlanState, SearchResponse, Target } from "@/lib/api";
 import { addDays, isoDate } from "@/lib/dates";
 
-const { push, searchPublications, lastVerse, datedPage, loadBooks, toast, openTarget, readingPlanCatalog, readingPlans, app } = vi.hoisted(() => ({
+const { openNote, switchTo, push, searchPublications, lastVerse, datedPage, loadBooks, toast, openTarget, readingPlanCatalog, readingPlans, app } = vi.hoisted(() => ({
+  openNote: vi.fn(),
+  switchTo: vi.fn(),
   readingPlanCatalog: vi.fn(),
   readingPlans: vi.fn(),
   app: { noBible: false },
@@ -30,7 +32,7 @@ const publications: PubCard[] = [
 vi.mock("@/lib/note-links", () => ({ loadBooks }));
 
 vi.mock("@/app", () => ({
-  useApp: () => ({ publications: app.noBible ? publications.filter((p) => !p.isBible) : publications, push, openTarget, toast, lang: "X", bibles: { X: "nwtsty" }, view: { name: "home" }, userVersion: 0 }),
+  useApp: () => ({ publications: app.noBible ? publications.filter((p) => !p.isBible) : publications, push, openTarget, openNote, switchTo, toast, lang: "X", bibles: { X: "nwtsty" }, view: { name: "home" }, userVersion: 0 }),
 }));
 
 import { CommandPalette } from "./command-palette";
@@ -179,6 +181,15 @@ describe("CommandPalette", () => {
     expect(screen.getByText("Open Bible reference")).toBeTruthy();
     expect(screen.getByText("Daily Text")).toBeTruthy();
     expect(screen.getByText("Keyboard shortcuts")).toBeTruthy();
+  });
+
+  it("starts a note without a page on Personal Study", () => {
+    render(<CommandPalette />);
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    fireEvent.click(screen.getByText("New note"));
+    expect(switchTo).toHaveBeenCalledWith("personal", { name: "personal", newNote: true }, undefined, [{ name: "personal", newNote: true }]);
+    expect(openNote).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
 
   it("opens the shortcut reference dialog and lists shortcuts", () => {

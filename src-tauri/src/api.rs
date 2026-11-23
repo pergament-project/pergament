@@ -12,12 +12,13 @@ use pergament::library::MediaEntry;
 use pergament::links::{Link, MediaKind, MediaRef};
 use pergament::mediator;
 use pergament::navigate::{self, Page, Target, TargetKind};
+use pergament::note_markdown;
 use pergament::reader::{BibleBook, TocNode};
 use pergament::render::{RenderOptions, Renderer, media_name};
 use pergament::search::{SearchRequest, SearchResponse, SearchStatus};
 use pergament::userdata::{Loc, Mark, Note, PublicationKey, UserData};
 use pergament::{Entry, Library, Publication};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub type ApiResult<T> = Result<T, String>;
 
@@ -967,38 +968,98 @@ pub fn page_user_data(
     })
 }
 
+/// Fields of a note being edited, which may differ from the saved note.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownText {
+    pub title: String,
+    pub content: String,
+    pub tags: Vec<String>,
+}
+
+/// A note to copy: a saved one by `guid`, or one being written on `target`.
+/// With a `guid`, the saved note's anchor is used and `target` and the block fields are ignored.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkdownRequest {
+    pub guid: Option<String>,
+    pub target: Option<Target>,
+    #[serde(default)]
+    pub block_type: i64,
+    pub block_identifier: Option<i64>,
+    pub text: Option<MarkdownText>,
+}
+
+/// The Markdown of the note `request` names, with its edited text if given.
+pub fn markdown_for(
+    library: &Library,
+    user: &UserData,
+    request: &MarkdownRequest,
+) -> ApiResult<String> {
+    let (anchor, saved) = if let Some(guid) = &request.guid {
+        let note = user
+            .note(guid)
+            .map_err(err)?
+            .ok_or_else(|| format!("no note {guid}"))?;
+        let location = note.location.as_ref();
+        let anchor = note_markdown::resolve(
+            library,
+            location.map(|l| &l.loc),
+            location.and_then(|l| l.title.as_deref()),
+            note.block_type,
+            note.block_identifier,
+        )
+        .map_err(err)?;
+        (anchor, Some(note))
+    } else if let Some(target) = &request.target {
+        let (loc, title) = page_location(library, target)?;
+        let anchor = note_markdown::resolve(
+            library,
+            Some(&loc),
+            Some(&title),
+            request.block_type,
+            request.block_identifier,
+        )
+        .map_err(err)?;
+        (anchor, None)
+    } else {
+        (note_markdown::Anchor::default(), None)
+    };
+    match (&request.text, &saved) {
+        (Some(t), _) => Ok(note_markdown::body(&t.title, &t.content, &t.tags, &anchor)),
+        (None, Some(n)) => Ok(note_markdown::body(&n.title, &n.content, &n.tags, &anchor)),
+        (None, None) => Err("nothing to copy".into()),
+    }
+}
+
 /// Where to open a note's or bookmark's page, if its publication is downloaded.
 pub fn open_location(library: &Library, loc: &Loc) -> ApiResult<Option<Target>> {
-    for entry in library.list().map_err(err)? {
-        if entry.meps_language != loc.meps_language {
-            continue;
-        }
-        let publication = Publication::open(library, &entry).map_err(err)?;
-        if publication.key_symbol().map_err(err)? != loc.key_symbol
-            || entry.issue_tag.parse::<i64>().unwrap_or(0) != loc.issue_tag
-        {
-            continue;
-        }
-        if let (Some(book), Some(chapter)) = (loc.book, loc.chapter)
-            && publication.is_bible()
-        {
-            return Ok(Some(Target {
-                publication: entry.dir_name,
-                kind: TargetKind::Chapter {
-                    book,
-                    chapter,
-                    verse: 1,
-                },
-            }));
-        }
-        if let Some(meps) = loc.document_id
-            && let Some(id) = publication.document_by_meps_id(meps).map_err(err)?
-        {
-            return Ok(Some(Target {
-                publication: entry.dir_name,
-                kind: TargetKind::Document(id),
-            }));
-        }
+    let Some(publication) =
+        Publication::find(library, &loc.key_symbol, loc.meps_language, loc.issue_tag)
+            .map_err(err)?
+    else {
+        return Ok(None);
+    };
+    let dir_name = publication.entry().dir_name.clone();
+    if let (Some(book), Some(chapter)) = (loc.book, loc.chapter)
+        && publication.is_bible()
+    {
+        return Ok(Some(Target {
+            publication: dir_name,
+            kind: TargetKind::Chapter {
+                book,
+                chapter,
+                verse: 1,
+            },
+        }));
+    }
+    if let Some(meps) = loc.document_id
+        && let Some(id) = publication.document_by_meps_id(meps).map_err(err)?
+    {
+        return Ok(Some(Target {
+            publication: dir_name,
+            kind: TargetKind::Document(id),
+        }));
     }
     Ok(None)
 }
@@ -1820,6 +1881,107 @@ mod tests {
                 .is_none()
         );
         assert!(dated_page(&lib, "X", "nope", "2026-10-07").is_err());
+    }
+
+    #[test]
+    fn markdown_of_a_saved_note_or_its_edited_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = Library::open(tmp.path().join("lib")).unwrap();
+        let mut user = UserData::open(tmp.path().join("userData.db")).unwrap();
+        let note = pergament::userdata::NoteInput {
+            title: "Saved".into(),
+            content: "saved text".into(),
+            tags: vec!["Prayer".into()],
+            ..Default::default()
+        };
+        let guid = user.save_note(None, None, &note).unwrap();
+
+        let saved = MarkdownRequest {
+            guid: Some(guid.clone()),
+            target: None,
+            block_type: 0,
+            block_identifier: None,
+            text: None,
+        };
+        assert_eq!(
+            markdown_for(&lib, &user, &saved).unwrap(),
+            "**Saved**\n\nsaved text\n\n#Prayer\n"
+        );
+
+        let edited = MarkdownRequest {
+            text: Some(MarkdownText {
+                title: "Edited".into(),
+                content: "new text".into(),
+                tags: vec![],
+            }),
+            ..saved
+        };
+        assert_eq!(
+            markdown_for(&lib, &user, &edited).unwrap(),
+            "**Edited**\n\nnew text\n"
+        );
+
+        let nothing = MarkdownRequest {
+            guid: None,
+            text: None,
+            ..edited
+        };
+        assert_eq!(
+            markdown_for(&lib, &user, &nothing).unwrap_err(),
+            "nothing to copy"
+        );
+    }
+
+    #[test]
+    fn markdown_of_a_saved_note_keeps_its_anchor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = Library::open(tmp.path().join("lib")).unwrap();
+        let mut user = UserData::open(tmp.path().join("userData.db")).unwrap();
+        let loc = Loc {
+            key_symbol: "zzz".into(),
+            meps_language: 0,
+            issue_tag: 0,
+            document_id: Some(7),
+            book: None,
+            chapter: None,
+        };
+        let note = pergament::userdata::NoteInput {
+            title: "Anchored".into(),
+            content: "saved text".into(),
+            block_type: pergament::userdata::BLOCK_PARAGRAPH,
+            block_identifier: Some(3),
+            ..Default::default()
+        };
+        let guid = user
+            .save_note(Some(&loc), Some("Stored Title"), &note)
+            .unwrap();
+
+        let saved = MarkdownRequest {
+            guid: Some(guid),
+            target: None,
+            block_type: 0,
+            block_identifier: None,
+            text: None,
+        };
+        assert_eq!(
+            markdown_for(&lib, &user, &saved).unwrap(),
+            "**Anchored**\n\n— Stored Title\n\nsaved text\n"
+        );
+
+        let edited = MarkdownRequest {
+            block_type: pergament::userdata::BLOCK_VERSE,
+            block_identifier: Some(99),
+            text: Some(MarkdownText {
+                title: "Anchored".into(),
+                content: "new text".into(),
+                tags: vec![],
+            }),
+            ..saved
+        };
+        assert_eq!(
+            markdown_for(&lib, &user, &edited).unwrap(),
+            "**Anchored**\n\n— Stored Title\n\nnew text\n"
+        );
     }
 
     #[test]

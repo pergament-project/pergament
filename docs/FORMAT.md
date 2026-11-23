@@ -590,6 +590,39 @@ at the last merge, kept in the app's data folder. [own]
   has committed. Merging the same file again, or a file equal to the base,
   changes nothing.
 
+## Markdown export
+
+Pergament's own format for notes exported to a folder (Settings, "Export
+notes"). The export is one-way: edits made in the folder are overwritten
+by the next export. [own]
+
+- The export folder must be an absolute path; a relative one is an error.
+- One `.md` file per note, all in the chosen folder (no subfolders). The
+  name is the note's title, otherwise the first words of its text,
+  otherwise `Note`. Characters not allowed in file names are dropped, the
+  name is capped at 80 characters and 200 bytes, Windows-reserved names
+  (`CON`, `COM1`, …) get a `_`, and clashes get ` 2`, ` 3` and so on.
+- Each file starts with front matter: `pergament-id` (the note's `Guid`),
+  `reference` (only when the note is anchored to a verse or paragraph),
+  `tags`, `created` and `modified` (UTC, ending in `Z`; a timestamp that
+  can't be read is written quoted as it is). The body is the
+  same Markdown as "Copy note": the title in bold, the quoted verse or
+  paragraph as a `>` quote ending in `> — Reference` (a reference without
+  a quote is a plain `— Reference` line), the text with app
+  links reduced to their label, and the tags as `#tags`.
+- `.pergament-export.json` is `{"version":1,"files":{"Name.md":"<guid>"}}`.
+  It lists the only files an export may overwrite or remove; every other
+  file in the folder is left alone. An unreadable manifest or an unknown
+  version stops the export before anything is written.
+- A file counts as the export's own only if the manifest lists it and the
+  folder holds a regular file with exactly that name, so links and folders
+  are never the export's own. On file systems that rewrite names (HFS+ stores
+  accented names decomposed), re-exporting a note with an accented title
+  therefore fails with an error instead of touching that file.
+- A folder holds one export. Two computers exporting into the same synced
+  folder share one manifest, so each export removes the files of notes it
+  doesn't have. Use one folder per computer.
+
 ## Unknown / not relied upon
 
 - What the `C` constant protects beyond obfuscation. We only reproduce the

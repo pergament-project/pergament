@@ -202,6 +202,15 @@ describe("Settings", () => {
     expect(screen.getByRole("radio", { name: "Full width" }).getAttribute("aria-checked")).toBe("true");
   });
 
+  it("chooses where notes open and remembers it", async () => {
+    renderIn(<SettingsView />);
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: "Interface" }));
+    expect((await screen.findByRole("radio", { name: "In the page" })).getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(screen.getByRole("radio", { name: "In a separate window" }));
+    expect(localStorage.getItem("noteOpen")).toBe("window");
+    expect(screen.getByRole("radio", { name: "In a separate window" }).getAttribute("aria-checked")).toBe("true");
+  });
+
   it("picks the interface language from a list", async () => {
     renderIn(<SettingsView />);
     fireEvent.mouseDown(await screen.findByRole("tab", { name: "Interface" }));
@@ -315,7 +324,7 @@ describe("Settings cache", () => {
 
 describe("Personal Study", () => {
   const note = (guid: string, title: string, color: number | null, lastModified: string) => ({
-    guid, title, content: "", blockType: 0, blockIdentifier: null, markGuid: null, color, tags: [], lastModified, location: null,
+    guid, title, content: "", blockType: 0, blockIdentifier: null, markGuid: null, color, tags: [], lastModified, created: lastModified, location: null,
   });
 
   it("narrows the notes by text and highlight color and changes their order", async () => {
@@ -355,6 +364,19 @@ describe("Personal Study", () => {
     expect(within(card as HTMLElement).getByText("map").className).toBe("md-link");
     expect(card.querySelector("b")).toBeNull();
     expect(card.textContent).toContain("<b>raw</b>");
+  });
+
+  it("copies a note as Markdown", async () => {
+    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, device: null });
+    backend.tags = () => [];
+    backend.bookmarks = () => [];
+    backend.all_notes = () => [note("a", "T", null, "2026-10-03T00:00:00Z")];
+    backend.note_markdown = () => "**T**\n";
+    renderIn(<PersonalView />);
+    fireEvent.click(await screen.findByRole("button", { name: "Copy note" }));
+    expect(await screen.findByText("Note copied")).toBeTruthy();
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith("**T**\n");
+    expect(calls.find((c) => c.cmd === "note_markdown")?.args).toEqual({ request: { guid: "a" } });
   });
 });
 
@@ -453,6 +475,90 @@ describe("Note in the study pane", () => {
     expect(screen.queryByRole("form")).toBeNull();
     // Only the notes signal moves; the study panes key on userVersion and would remount.
     expect(screen.getByTestId("versions").textContent).toBe("0/1");
+  });
+
+  it("writes a new note on Personal Study and saves it without a page", async () => {
+    backend.save_note = () => "n1";
+    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null });
+    backend.tags = () => [];
+    backend.bookmarks = () => [];
+    backend.all_notes = () => [];
+    renderIn(<PersonalView />);
+    fireEvent.click(await screen.findByRole("button", { name: "New note" }));
+    const editor = await screen.findByRole("form", { name: "New note" });
+    expect(calls.some((c) => c.cmd === "open_note_window")).toBe(false);
+    fireEvent.change(within(editor).getByPlaceholderText("Note"), { target: { value: "Ideas" } });
+    fireEvent.click(within(editor).getByText("Save"));
+    await waitFor(() => expect(calls.some((c) => c.cmd === "save_note")).toBe(true));
+    expect(calls.find((c) => c.cmd === "save_note")!.args).toMatchObject({ target: null, note: { content: "Ideas", markGuid: null } });
+    await waitFor(() => expect(screen.queryByRole("form")).toBeNull());
+  });
+
+  it("opens an empty note on Personal Study when asked from elsewhere", async () => {
+    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null });
+    backend.tags = () => [];
+    backend.bookmarks = () => [];
+    backend.all_notes = () => [];
+    function Shown() {
+      const { view, switchTo } = useApp();
+      return view.name === "personal" ? (
+        <PersonalView />
+      ) : (
+        <button onClick={() => switchTo("personal", { name: "personal", newNote: true }, undefined, [{ name: "personal", newNote: true }])}>go</button>
+      );
+    }
+    renderIn(<Shown />);
+    fireEvent.click(screen.getByText("go"));
+    expect(await screen.findByRole("form", { name: "New note" })).toBeTruthy();
+    expect(calls.some((c) => c.cmd === "open_note_window")).toBe(false);
+  });
+
+  it("opens notes in the note window when the setting asks for it", async () => {
+    localStorage.setItem("noteOpen", "window");
+    backend.open_note_window = () => undefined;
+    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null });
+    backend.tags = () => [];
+    backend.bookmarks = () => [];
+    backend.all_notes = () => [];
+    renderIn(<PersonalView />);
+    fireEvent.click(await screen.findByRole("button", { name: "New note" }));
+    await waitFor(() =>
+      expect(vi.mocked(emitTo)).toHaveBeenCalledWith("note", "note-open", expect.objectContaining({ draft: { note: {} } })),
+    );
+    expect(screen.queryByRole("form")).toBeNull();
+  });
+
+  it("edits a note without a page in place on Personal Study", async () => {
+    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, device: null });
+    backend.tags = () => [];
+    backend.bookmarks = () => [];
+    backend.all_notes = () => [
+      { guid: "a", title: "Loose thought", content: "", blockType: 0, blockIdentifier: null, markGuid: null, color: null, tags: [], lastModified: "2026-10-03T00:00:00Z", created: "2026-10-03T00:00:00Z", location: null },
+    ];
+    renderIn(<PersonalView />);
+    fireEvent.click(await screen.findByRole("button", { name: "Edit note" }));
+    const editor = await screen.findByRole("form", { name: "Edit note" });
+    expect((within(editor).getByDisplayValue("Loose thought") as HTMLInputElement).value).toBe("Loose thought");
+    expect(calls.some((c) => c.cmd === "open_note_window")).toBe(false);
+  });
+
+  it("saves a note without a page as free-standing", async () => {
+    backend.save_note = () => "n2";
+    renderIn(
+      <>
+        <Harness />
+        <InlineNoteEditor />
+      </>,
+    );
+    fireEvent.click(screen.getByText("other"));
+    const editor = await screen.findByRole("form", { name: "New note" });
+    fireEvent.change(within(editor).getByPlaceholderText("Note"), { target: { value: "Ideas" } });
+    fireEvent.click(within(editor).getByText("Save"));
+    await waitFor(() => expect(calls.some((c) => c.cmd === "save_note")).toBe(true));
+    expect(calls.find((c) => c.cmd === "save_note")!.args).toEqual({
+      target: null,
+      note: { title: "Another", content: "Ideas", tags: [], guid: undefined, blockType: 0, blockIdentifier: null, markGuid: null },
+    });
   });
 
   it("previews Markdown and opens its links in the browser", async () => {
@@ -1115,7 +1221,7 @@ describe("Coming back to a page", () => {
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [
-      { guid: "a", title: "Dusk visits", content: "", blockType: 0, blockIdentifier: null, markGuid: null, color: null, tags: [], lastModified: "2026-10-03T00:00:00Z", location: null },
+      { guid: "a", title: "Dusk visits", content: "", blockType: 0, blockIdentifier: null, markGuid: null, color: null, tags: [], lastModified: "2026-10-03T00:00:00Z", created: "2026-10-03T00:00:00Z", location: null },
     ];
     const first = renderIn(<PersonalView />);
     await screen.findByText("Dusk visits");
@@ -1518,5 +1624,69 @@ describe("folder sync", () => {
       expect(text).toContain("Restoring replaces");
       expect(text).not.toContain(sentence);
     });
+  });
+});
+
+describe("export notes", () => {
+  const report = (over: object = {}) => ({ notes: 3, created: 3, updated: 0, removed: 0, unchanged: 0, ...over });
+  const exportCalls = () => calls.filter((c) => c.cmd === "export_notes");
+  beforeEach(() => {
+    vi.mocked(ask).mockReset();
+    vi.mocked(open).mockReset();
+    backend.cache_usage = () => ({ catalog: 0, covers: 0, partial: 0, other: 0, total: 0 });
+    backend.auto_settings = () => ({ rolling: { enabled: true, keep: 10 }, sync: { folder: null, deviceId: null } });
+    backend.sync_status = () => ({ folder: null, lastSync: null, lastDevice: null, error: null, pending: [], conflicts: [] });
+  });
+  const exportTo = async () => {
+    renderIn(<SettingsView />);
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: "Library & data" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Export to folder…" }));
+  };
+
+  it("exports without asking when nothing is overwritten", async () => {
+    vi.mocked(open).mockResolvedValue("/tmp/notes");
+    backend.export_notes = ({ dryRun }) => report(dryRun ? {} : { notes: 3 });
+    await exportTo();
+    expect(await screen.findByText("Exported 3 notes")).toBeTruthy();
+    expect(ask).not.toHaveBeenCalled();
+    expect(exportCalls().map((c) => c.args)).toEqual([
+      { folder: "/tmp/notes", dryRun: true },
+      { folder: "/tmp/notes", dryRun: false },
+    ]);
+  });
+
+  it("stops when the overwrite is declined", async () => {
+    vi.mocked(open).mockResolvedValue("/tmp/notes");
+    vi.mocked(ask).mockResolvedValue(false);
+    backend.export_notes = () => report({ created: 2, updated: 1 });
+    await exportTo();
+    await waitFor(() => expect(ask).toHaveBeenCalled());
+    expect(vi.mocked(ask).mock.calls[0]).toEqual([
+      "1 exported notes will be overwritten and 0 removed. Changes made to them in the folder are lost.",
+      { title: "Update exported notes?", kind: "warning", okLabel: "Export" },
+    ]);
+    await act(async () => {
+      await vi.mocked(ask).mock.results[0].value;
+    });
+    expect(exportCalls()).toHaveLength(1);
+    expect(exportCalls()[0].args).toEqual({ folder: "/tmp/notes", dryRun: true });
+  });
+
+  it("does nothing when the folder dialog is cancelled", async () => {
+    vi.mocked(open).mockResolvedValue(null);
+    backend.export_notes = () => report();
+    await exportTo();
+    await waitFor(() => expect(open).toHaveBeenCalled());
+    await act(async () => undefined);
+    expect(exportCalls()).toHaveLength(0);
+  });
+
+  it("shows a failing export", async () => {
+    vi.mocked(open).mockResolvedValue("/tmp/notes");
+    backend.export_notes = () => {
+      throw "disk full";
+    };
+    await exportTo();
+    expect(await screen.findByText("Could not export notes: disk full")).toBeTruthy();
   });
 });

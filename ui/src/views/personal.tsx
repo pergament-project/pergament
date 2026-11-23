@@ -4,7 +4,7 @@ import { AppBar, SectionTitle, useApp } from "@/app";
 import { api, type Bookmark, type BookmarkAnchor, type Loc, type Note, type TagInfo, type UserDataSummary } from "@/lib/api";
 import { BOOKMARK_COLORS } from "@/components/bookmarks";
 import { cn } from "@/lib/utils";
-import { NoteCard } from "@/components/notes";
+import { InlineNoteEditor, NoteCard, useCopyNote } from "@/components/notes";
 import { ReadingPlansSection } from "@/components/reading-plans";
 import { Input } from "@/components/ui/input";
 import { HIGHLIGHT_COLORS } from "@/lib/marks";
@@ -24,7 +24,8 @@ interface Loaded {
 let cachedLoad: Loaded | undefined;
 
 export function PersonalView() {
-  const { push, toast, userVersion, notesVersion, createBackup, restoreBackup, mergeBackups, openNote } = useApp();
+  const { push, toast, userVersion, notesVersion, createBackup, restoreBackup, mergeBackups, openNote, note, releaseNote, view, replace } = useApp();
+  const copyNote = useCopyNote();
   const [summary, setSummary] = useState<UserDataSummary | null>(cachedLoad?.summary ?? null);
   const [tags, setTags] = useState<TagInfo[]>(cachedLoad?.tags ?? []);
   const [tag, setTag] = useState<number | null>(null);
@@ -34,6 +35,17 @@ export function PersonalView() {
   const [color, setColor] = useState<number | null>(null);
   const [sort, setSort] = useState<NoteSort>("newest");
   const shown = filterNotes(notes, { query, color, sort });
+  // The note being written lives on this page: leaving it moves unsaved text to the note window.
+  useEffect(() => releaseNote, [releaseNote]);
+  const newNote = view.name === "personal" && view.newNote;
+  useEffect(() => {
+    if (!newNote) return;
+    replace({ name: "personal" });
+    void openNote({ note: {} }, { in: "pane" });
+  }, [newNote, replace, openNote]);
+  const editing = note && !note.moving ? note.draft.note.guid : undefined;
+  const detached = Boolean(note && !note.moving && (!editing || !shown.some((n) => n.guid === editing)));
+  const edit = (n?: Note) => void openNote({ note: n ?? {} }, { in: "pane" });
 
   useEffect(() => {
     let live = true;
@@ -89,6 +101,17 @@ export function PersonalView() {
           <ReadingPlansSection />
 
           <SectionTitle>Notes and Tags</SectionTitle>
+          <button
+            onClick={() => edit()}
+            className="mb-4 flex items-center gap-2 rounded-md border border-line bg-surface px-4 py-2 text-sm hover:bg-bar"
+          >
+            <Plus size={17} /> {t("New note")}
+          </button>
+          {detached && (
+            <div className="mb-4">
+              <InlineNoteEditor />
+            </div>
+          )}
           {tags.length > 0 && (
             <div className="mb-4 flex flex-wrap gap-1.5">
               <Chip active={tag === null} onClick={() => setTag(null)}>
@@ -147,23 +170,28 @@ export function PersonalView() {
           ) : (
             <div className="flex flex-col gap-2">
               {shown.map((n) => (
+                editing === n.guid ? (
+                  <InlineNoteEditor key={n.guid} />
+                ) : (
                 <div key={n.guid} className="flex items-stretch gap-1">
                   <div className="min-w-0 flex-1">
                     <NoteCard
                       note={n}
                       subtitle={n.location?.title ?? undefined}
-                      onClick={n.location ? () => void open(n.location!, n.guid) : () => void openNote({ note: n })}
+                      onClick={n.location ? () => void open(n.location!, n.guid) : () => edit(n)}
+                      onCopy={() => void copyNote(n.guid)}
                     />
                   </div>
                   <button
                     title={t("Edit note")}
                     aria-label={t("Edit note")}
-                    onClick={() => void openNote({ note: n })}
+                    onClick={() => edit(n)}
                     className="flex w-10 items-center justify-center rounded-md border border-line text-muted hover:bg-bar hover:text-fg"
                   >
                     <Pencil size={16} />
                   </button>
                 </div>
+                )
               ))}
             </div>
           )}

@@ -15,7 +15,8 @@ type ViewKind =
   | { name: "category"; id: number; title: string }
   | { name: "media"; key: string; title: string }
   | { name: "meetings"; week?: string }
-  | { name: "personal" };
+  /** `newNote` opens an empty note editor once the page is shown. */
+  | { name: "personal"; newNote?: boolean };
 
 /** A view and how far it was scrolled when its section was left. */
 export type View = ViewKind & { scroll?: number };

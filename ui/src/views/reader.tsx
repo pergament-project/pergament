@@ -21,7 +21,7 @@ import { applyMarks, blockElements, blockOf, markText, rangeText, selectionRange
 import { loadAnswer, saveAnswer, saveLastColor } from "@/lib/settings";
 import { clickedImage, hydrateMedia } from "@/lib/media";
 import { parseBibleRange } from "@/lib/parallel";
-import { InlineNoteEditor, MarkToolbar, NoteCard } from "@/components/notes";
+import { InlineNoteEditor, MarkToolbar, NoteCard, useCopyNote } from "@/components/notes";
 import { GoToButton } from "@/components/go-to";
 import { BOOKMARK_COLORS, BookmarksButton } from "@/components/bookmarks";
 import { OutlineSection } from "@/components/outline-section";
@@ -86,6 +86,7 @@ export function ReaderView({
     openNote,
     setLinkHandler,
   } = useApp();
+  const copyNote = useCopyNote();
   /** The note being written in the pane; one moving to the note window is gone from here already. */
   const inlineNote = written?.moving ? null : written;
   const [refs, setRefs] = useState<PaneRef[]>([]);
@@ -748,6 +749,7 @@ export function ReaderView({
                         expanded={expanded.has(n.guid)}
                         onToggle={() => toggleNote(n.guid)}
                         onClick={() => void openNote({ note: n }, { in: "pane" })}
+                        onCopy={() => void copyNote(n.guid)}
                         onAppLink={followNoteLink}
                       />
                     )}

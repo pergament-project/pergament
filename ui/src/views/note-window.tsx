@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
-import { NoteForm, saveDraft, type NoteSaveInput } from "@/components/notes";
+import { copyNoteMarkdown, NoteForm, requestFor, saveDraft, type NoteSaveInput } from "@/components/notes";
 import { api, type PubCard } from "@/lib/api";
 import { fieldsOf, sameFields } from "@/lib/notes";
 import {
@@ -194,6 +194,7 @@ export function NoteWindowView() {
         onOpenLink={showNoteLink}
         onCancel={() => void cancel()}
         onSave={(input: NoteSaveInput) => run(() => saveDraft(draft, input))}
+        onCopy={(input) => copyNoteMarkdown(requestFor(draft, input))}
         onDelete={draft.note.guid ? () => run(() => api.deleteNote(draft.note.guid!)) : undefined}
       />
     </div>

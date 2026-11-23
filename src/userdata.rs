@@ -159,6 +159,7 @@ pub struct Note {
     pub color: Option<i64>,
     pub tags: Vec<String>,
     pub last_modified: String,
+    pub created: String,
     pub location: Option<NoteLocation>,
 }
 
@@ -299,6 +300,39 @@ impl std::fmt::Debug for UserData {
     }
 }
 
+/// Register the SQL functions the merge queries rely on.
+fn register_functions(conn: &Connection) -> Result<()> {
+    // JW Library on iOS writes `LastModified` with a UTC offset without a
+    // colon (`+0100`), which `julianday()` cannot parse. Insert the colon so
+    // `±HHMM` becomes `±HH:MM`; every other form passes unchanged.
+    conn.create_scalar_function(
+        "normalize_timestamp",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let s = ctx.get::<String>(0)?;
+            let b = s.as_bytes();
+            if b.len() >= 5 {
+                let offset = &b[b.len() - 5..];
+                let sign = offset[0];
+                let digits = &offset[1..];
+                let plain = (sign == b'+' || sign == b'-')
+                    && digits.iter().all(u8::is_ascii_digit)
+                    && !digits.contains(&b':');
+                if plain {
+                    let mut out = String::with_capacity(s.len() + 1);
+                    out.push_str(&s[..s.len() - 2]);
+                    out.push(':');
+                    out.push_str(&s[s.len() - 2..]);
+                    return Ok(out);
+                }
+            }
+            Ok(s)
+        },
+    )?;
+    Ok(())
+}
+
 impl UserData {
     /// Open the database at `path`, creating an empty one if it is missing.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -310,6 +344,7 @@ impl UserData {
         conn.execute_batch(
             "PRAGMA trusted_schema = OFF; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2000;",
         )?;
+        register_functions(&conn)?;
         let has_schema: bool = conn.query_row(
             "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'UserMark'",
             [],
@@ -726,14 +761,15 @@ impl UserData {
     const NOTE_SELECT: &str = "SELECT n.NoteId, n.Guid, IFNULL(n.Title, ''), IFNULL(n.Content, ''),
             n.BlockType, n.BlockIdentifier, m.UserMarkGuid, m.ColorIndex, n.LastModified,
             l.KeySymbol, l.MepsLanguage, l.IssueTagNumber, l.DocumentId, l.BookNumber,
-            l.ChapterNumber, l.Title
+            l.ChapterNumber, l.Title, IFNULL(n.Created, n.LastModified)
          FROM Note n
          LEFT JOIN UserMark m ON m.UserMarkId = n.UserMarkId
          LEFT JOIN Location l ON l.LocationId = n.LocationId";
 
     fn notes_where(&self, condition: &str, values: &[&dyn rusqlite::ToSql]) -> Result<Vec<Note>> {
         let mut stmt = self.conn.prepare(&format!(
-            "{} {condition} ORDER BY n.LastModified DESC, n.NoteId DESC",
+            "{} {condition} ORDER BY julianday(normalize_timestamp(n.LastModified)) DESC,
+             n.NoteId DESC",
             Self::NOTE_SELECT
         ))?;
         let rows = stmt.query_map(values, |r| {
@@ -765,6 +801,7 @@ impl UserData {
                     color: r.get(7)?,
                     tags: Vec::new(),
                     last_modified: r.get(8)?,
+                    created: r.get(16)?,
                     location,
                 },
             ))
@@ -796,6 +833,11 @@ impl UserData {
         Ok(out)
     }
 
+    /// The note with `guid`, if any.
+    pub fn note(&self, guid: &str) -> Result<Option<Note>> {
+        Ok(self.notes_where("WHERE n.Guid = ?1", &[&guid])?.pop())
+    }
+
     /// All notes, newest first, optionally only those with tag `tag`.
     pub fn all_notes(&self, tag: Option<i64>) -> Result<Vec<Note>> {
         match tag {
@@ -807,7 +849,8 @@ impl UserData {
         }
     }
 
-    /// Create or update a note; returns its guid. `loc` is needed to create.
+    /// Create or update a note; returns its guid. `loc` anchors a new note;
+    /// omit it to create a free-standing note with no page or highlight.
     pub fn save_note(
         &mut self,
         loc: Option<&Loc>,
@@ -836,8 +879,10 @@ impl UserData {
                 (id, guid)
             }
             None => {
-                let loc = loc.ok_or_else(|| Error::NotFound("page for the new note".into()))?;
-                let location = Self::location_id(&tx, loc, title)?;
+                let location: Option<i64> = match loc {
+                    Some(loc) => Some(Self::location_id(&tx, loc, title)?),
+                    None => None,
+                };
                 let mark: Option<i64> = match &note.mark_guid {
                     Some(g) => tx
                         .query_row(
@@ -850,7 +895,9 @@ impl UserData {
                 };
                 let (block_type, block) = match note.block_identifier {
                     Some(b)
-                        if note.block_type == BLOCK_PARAGRAPH || note.block_type == BLOCK_VERSE =>
+                        if location.is_some()
+                            && (note.block_type == BLOCK_PARAGRAPH
+                                || note.block_type == BLOCK_VERSE) =>
                     {
                         (note.block_type, Some(b))
                     }
@@ -1494,8 +1541,8 @@ fn take_later_clock(tx: &Transaction<'_>) -> Result<()> {
     tx.execute(
         "UPDATE main.LastModified
          SET LastModified = (SELECT LastModified FROM inc.LastModified LIMIT 1)
-         WHERE julianday((SELECT LastModified FROM inc.LastModified LIMIT 1))
-               > julianday(LastModified)",
+         WHERE julianday(normalize_timestamp((SELECT LastModified FROM inc.LastModified LIMIT 1)))
+               > julianday(normalize_timestamp(LastModified))",
         [],
     )?;
     Ok(())
@@ -1505,8 +1552,8 @@ fn take_later_clock(tx: &Transaction<'_>) -> Result<()> {
 /// by the database-wide `LastModified`; `None` when equal or unknown.
 fn incoming_is_newer(tx: &Transaction<'_>) -> Result<Option<bool>> {
     let diff: Option<f64> = tx.query_row(
-        "SELECT julianday((SELECT LastModified FROM inc.LastModified))
-              - julianday((SELECT LastModified FROM main.LastModified))",
+        "SELECT julianday(normalize_timestamp((SELECT LastModified FROM inc.LastModified)))
+              - julianday(normalize_timestamp((SELECT LastModified FROM main.LastModified)))",
         [],
         |r| r.get(0),
     )?;
@@ -2333,7 +2380,8 @@ fn merge_notes(
         type LocalNote = (i64, Option<f64>, bool, Option<String>, Option<String>);
         let local: Option<LocalNote> = tx
             .query_row(
-                "SELECT m.NoteId, julianday(i.LastModified) - julianday(m.LastModified),
+                "SELECT m.NoteId, julianday(normalize_timestamp(i.LastModified))
+                                 - julianday(normalize_timestamp(m.LastModified)),
                         m.Title IS i.Title AND m.Content IS i.Content, m.Title, m.Content
                  FROM main.Note m, inc.Note i WHERE i.NoteId = ?1 AND m.Guid = i.Guid",
                 [note.id],
@@ -4860,6 +4908,112 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn create_free_standing_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ud = UserData::open(tmp.path().join(DB_NAME)).unwrap();
+        // A block without a page is dropped, as JW Library stores it.
+        let note_data = NoteInput {
+            block_type: BLOCK_VERSE,
+            block_identifier: Some(3),
+            ..note_input("Free", "content", &["study"])
+        };
+        let guid = ud.save_note(None, None, &note_data).unwrap();
+
+        let saved = note(&ud, &guid);
+        assert!(saved.location.is_none());
+        assert!(saved.mark_guid.is_none());
+        assert_eq!((saved.block_type, saved.block_identifier), (0, None));
+        assert_eq!(saved.content, "content");
+        assert_eq!(saved.tags, ["study"]);
+        let (location, mark): (Option<i64>, Option<i64>) = ud
+            .conn
+            .query_row(
+                "SELECT LocationId, UserMarkId FROM Note WHERE Guid = ?1",
+                [&guid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((location, mark), (None, None));
+    }
+
+    /// Checks a note has no page and no highlight, in the API and in the database.
+    fn assert_free_standing(ud: &UserData, guid: &str, title: &str, content: &str, tags: &[&str]) {
+        let n = note(ud, guid);
+        assert!(n.location.is_none());
+        assert!(n.mark_guid.is_none());
+        assert_eq!((n.block_type, n.block_identifier), (0, None));
+        assert_eq!((n.title.as_str(), n.content.as_str()), (title, content));
+        assert_eq!(n.tags, tags);
+        let row: (Option<i64>, Option<i64>, i64) = ud
+            .conn
+            .query_row(
+                "SELECT LocationId, UserMarkId, BlockType FROM Note WHERE Guid = ?1",
+                [guid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, 0));
+    }
+
+    #[test]
+    fn free_standing_note_survives_backup_and_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ud = UserData::open(tmp.path().join("a").join(DB_NAME)).unwrap();
+        let guid = ud
+            .save_note(
+                None,
+                None,
+                &note_input("Free", "loose thought", &["study", "ideas"]),
+            )
+            .unwrap();
+        let file = backup_of(&ud, tmp.path(), "free.jwlibrary");
+        let mut other = UserData::open(tmp.path().join("b").join(DB_NAME)).unwrap();
+        other.restore_backup(&file).unwrap();
+        assert_free_standing(&other, &guid, "Free", "loose thought", &["ideas", "study"]);
+        assert_eq!(count(&other, "Location"), 0);
+        assert_foreign_keys_hold(&other);
+    }
+
+    #[test]
+    fn merge_adds_free_standing_note_and_takes_the_newer_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut local = UserData::open(tmp.path().join("l").join(DB_NAME)).unwrap();
+        local
+            .save_note(Some(&bible(1)), None, &note_input("Anchored", "a", &[]))
+            .unwrap();
+        let mut remote = UserData::open(tmp.path().join("r").join(DB_NAME)).unwrap();
+        let guid = remote
+            .save_note(None, None, &note_input("Free", "first", &["Remote"]))
+            .unwrap();
+        let r = local
+            .merge_backup(&backup_of(&remote, tmp.path(), "r1.jwlibrary"))
+            .unwrap();
+        assert_eq!(r.added, 1);
+        assert_free_standing(&local, &guid, "Free", "first", &["Remote"]);
+
+        // Edited on both sides: the newer note wins and stays free-standing.
+        edit_note(&mut remote, &guid, "Free", "newer", &["Remote"]);
+        set_note_time(&remote, &guid, "2030-01-01T00:00:00Z");
+        edit_note(&mut local, &guid, "Free", "older", &["Local"]);
+        set_note_time(&local, &guid, "2020-01-01T00:00:00Z");
+        let r = local
+            .merge_backup(&backup_of(&remote, tmp.path(), "r2.jwlibrary"))
+            .unwrap();
+        assert_eq!((r.added, r.updated), (0, 1));
+        assert!(r.conflicts.is_empty(), "{:?}", r.conflicts);
+        assert_free_standing(&local, &guid, "Free", "newer", &["Remote"]);
+        assert_eq!(count(&local, "Note"), 2);
+        assert_foreign_keys_hold(&local);
+
+        // Merging the same file again changes nothing.
+        let r = local
+            .merge_backup(&backup_of(&remote, tmp.path(), "r3.jwlibrary"))
+            .unwrap();
+        assert_eq!((r.added, r.updated), (0, 0));
+        assert_eq!(count(&local, "Note"), 2);
+    }
+
     fn note_input(title: &str, content: &str, tags: &[&str]) -> NoteInput {
         NoteInput {
             title: title.into(),
@@ -4885,9 +5039,105 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn note_by_guid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ud = UserData::open(tmp.path().join(DB_NAME)).unwrap();
+        let guid = ud
+            .save_note(Some(&bible(1)), None, &note_input("T", "body", &[]))
+            .unwrap();
+        let found = ud.note(&guid).unwrap().unwrap();
+        assert_eq!(found.guid, guid);
+        assert!(!found.created.is_empty());
+        assert!(ud.note("missing").unwrap().is_none());
+    }
+
     fn assert_foreign_keys_hold(ud: &UserData) {
         let mut fk = ud.conn.prepare("PRAGMA foreign_key_check").unwrap();
         assert!(fk.query([]).unwrap().next().unwrap().is_none());
+    }
+
+    #[test]
+    fn merge_notes_with_utc_offset_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut local = UserData::open(tmp.path().join("l").join(DB_NAME)).unwrap();
+        let guid = local
+            .save_note(Some(&bible(1)), None, &note_input("T", "old", &[]))
+            .unwrap();
+
+        let mut remote = UserData::open(tmp.path().join("r").join(DB_NAME)).unwrap();
+        remote
+            .restore_backup(&backup_of(&local, tmp.path(), "seed.jwlibrary"))
+            .unwrap();
+
+        // The remote note differs and is clearly newer, but its timestamp
+        // uses the iOS UTC offset form without a colon.
+        remote
+            .conn
+            .execute(
+                "UPDATE Note SET Content = 'new', Title = 'U' WHERE Guid = ?1",
+                [&guid],
+            )
+            .unwrap();
+        set_note_time(&remote, &guid, "2026-11-22T17:57:27+0100");
+        set_note_time(&local, &guid, "2026-11-22T15:00:00Z");
+        set_db_time(&remote, "2026-11-22T17:57:27+0100");
+        set_db_time(&local, "2026-11-22T15:00:00Z");
+
+        // Without normalization, julianday() is NULL for the backup's
+        // timestamp and the merge reports a conflict instead of taking the
+        // clearly newer note.
+        let r = local
+            .merge_backup(&backup_of(&remote, tmp.path(), "r.jwlibrary"))
+            .unwrap();
+        assert!(r.conflicts.iter().all(|c| c.guid != guid));
+        let merged = note(&local, &guid);
+        assert_eq!(merged.content, "new");
+        assert_eq!(merged.title, "U");
+    }
+
+    #[test]
+    fn test_normalize_timestamp() {
+        let conn = Connection::open_in_memory().unwrap();
+        register_functions(&conn).unwrap();
+
+        let tests = [
+            ("2026-11-22T17:57:27+0100", "2026-11-22T17:57:27+01:00"),
+            ("2026-11-22T17:57:27-0500", "2026-11-22T17:57:27-05:00"),
+            ("2026-11-22T17:57:27Z", "2026-11-22T17:57:27Z"),
+            ("2026-11-22T17:57:27+00:00", "2026-11-22T17:57:27+00:00"),
+            ("invalid", "invalid"),
+        ];
+
+        for (input, expected) in tests {
+            let normalized: String = conn
+                .query_row(&format!("SELECT normalize_timestamp('{input}')"), [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(normalized, expected);
+        }
+    }
+
+    #[test]
+    fn all_notes_orders_by_instant_not_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ud = UserData::open(tmp.path().join(DB_NAME)).unwrap();
+        let first = ud
+            .save_note(Some(&bible(1)), None, &note_input("first", "a", &[]))
+            .unwrap();
+        let second = ud
+            .save_note(Some(&bible(1)), None, &note_input("second", "b", &[]))
+            .unwrap();
+        // `second` reads 17:57+0200 (15:57 UTC) and `first` reads 16:00Z
+        // (16:00 UTC). By text `second` would come first; by instant `first` is
+        // newer and must come first.
+        set_note_time(&ud, &second, "2026-11-22T17:57:27+0200");
+        set_note_time(&ud, &first, "2026-11-22T16:00:00Z");
+
+        let notes: Vec<_> = ud.all_notes(None).unwrap();
+        let titles: Vec<_> = notes.iter().map(|n| n.title.clone()).collect();
+        assert_eq!(titles, ["first", "second"]);
     }
 
     /// The `LocationId` of a `nwtsty` row (book 19), adding it when missing.
@@ -6709,6 +6959,33 @@ mod tests {
             assert_eq!(note(&a.ud, &attached).tags, vec!["t"]);
             assert_foreign_keys_hold(&a.ud);
             assert_eq!(a.ud.snapshot().unwrap(), b.ud.snapshot().unwrap());
+        }
+
+        #[test]
+        fn sync_carries_free_standing_notes_both_ways() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let guid =
+                a.ud.save_note(None, None, &note_input("Free", "on a", &["t"]))
+                    .unwrap();
+            sync_both(&mut a, &mut b);
+            assert_free_standing(&b.ud, &guid, "Free", "on a", &["t"]);
+
+            // Edited on B only: A takes the edit.
+            edit_note(&mut b.ud, &guid, "Free", "edited on b", &["t", "u"]);
+            let r = sync(&b, &mut a);
+            assert!(r.report.conflicts.is_empty(), "{:?}", r.report.conflicts);
+            assert_free_standing(&a.ud, &guid, "Free", "edited on b", &["t", "u"]);
+
+            // Deleted on A: B deletes it too.
+            sync(&a, &mut b);
+            a.ud.delete_note(&guid).unwrap();
+            let r = merged(try_sync(&a, &mut b, DeleteGuard::Apply));
+            // The note and its two tag links.
+            assert_eq!(r.deleted, 3);
+            assert!(!has_note(&b.ud, &guid));
+            assert_eq!(count(&b.ud, "TagMap"), 0);
+            assert_foreign_keys_hold(&b.ud);
         }
 
         #[test]
