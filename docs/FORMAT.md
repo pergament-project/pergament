@@ -615,6 +615,9 @@ by the next export. [own]
   are never the export's own. On file systems that rewrite names (HFS+ stores
   accented names decomposed), re-exporting a note with an accented title
   therefore fails with an error instead of touching that file.
+- A folder holds one export. Two computers exporting into the same synced
+  folder share one manifest, so each export removes the files of notes it
+  doesn't have. Use one folder per computer.
 
 ## Unknown / not relied upon
 
