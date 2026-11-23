@@ -6,9 +6,11 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::sync_snapshot::{LocKey, loc_key};
 use crate::{Error, Result};
 
 pub const TICKS_PER_SECOND: i64 = 10_000_000;
@@ -108,10 +110,174 @@ pub struct Playlist {
     pub items: Vec<PlaylistItemInfo>,
 }
 
-/// A plain file name: 1..=128 chars, none of `/ \ :` or NUL, not starting with `.`.
+/// One item of a playlist as the content hash sees it (spec "Content hash
+/// of a playlist"): no database ids, and media by `FilePath` and stored
+/// `Hash`, never by the file on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ItemContent {
+    pub label: String,
+    pub start_trim: Option<i64>,
+    pub end_trim: Option<i64>,
+    pub end_action: i64,
+    pub source: SourceContent,
+    /// `ThumbnailFilePath`.
+    pub thumbnail: Option<String>,
+    /// By `StartTimeTicks`.
+    pub markers: Vec<MarkerContent>,
+}
+
+/// Where an item's media comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) enum SourceContent {
+    /// Location key, `MajorMultimediaType` and `BaseDurationTicks`.
+    Location(LocKey, i64, i64),
+    /// `FilePath`, `Hash` and `DurationTicks`.
+    Media(String, String, i64),
+}
+
+/// A `PlaylistItemMarker` with its verse and paragraph maps (sorted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct MarkerContent {
+    pub label: String,
+    pub start: i64,
+    pub duration: i64,
+    pub end_transition: i64,
+    pub verses: Vec<i64>,
+    /// `(MepsDocumentId, ParagraphIndex, MarkerIndexWithinParagraph)`.
+    pub paragraphs: Vec<(i64, i64, i64)>,
+}
+
+/// The ordered items of playlist `tag` in database `schema` ("main" or
+/// "inc"). An item with a location comes as that location, like in the
+/// playlist view; an item without a location or media is left out. The
+/// caller makes sure `schema` has the playlist tables (`inc` may lack them).
+// Read by the merge and the sync of playlists; until then only by tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn content(conn: &Connection, schema: &str, tag: i64) -> Result<Vec<ItemContent>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT i.PlaylistItemId, i.Label, i.StartTrimOffsetTicks, i.EndTrimOffsetTicks,
+                i.EndAction, i.ThumbnailFilePath
+         FROM {schema}.TagMap t JOIN {schema}.PlaylistItem i ON i.PlaylistItemId = t.PlaylistItemId
+         WHERE t.TagId = ?1 ORDER BY t.Position, t.TagMapId"
+    ))?;
+    let rows = stmt
+        .query_map([tag], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut items = Vec::with_capacity(rows.len());
+    for (id, label, start_trim, end_trim, end_action, thumbnail) in rows {
+        let Some(source) = source_content(conn, schema, id)? else {
+            continue;
+        };
+        items.push(ItemContent {
+            label,
+            start_trim,
+            end_trim,
+            end_action,
+            source,
+            thumbnail,
+            markers: marker_content(conn, schema, id)?,
+        });
+    }
+    Ok(items)
+}
+
+fn source_content(conn: &Connection, schema: &str, item: i64) -> Result<Option<SourceContent>> {
+    let location: Option<(i64, i64, i64)> = conn
+        .query_row(
+            &format!(
+                "SELECT LocationId, MajorMultimediaType, IFNULL(BaseDurationTicks, 0)
+                 FROM {schema}.PlaylistItemLocationMap WHERE PlaylistItemId = ?1
+                 ORDER BY LocationId LIMIT 1"
+            ),
+            [item],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    if let Some((location, kind, ticks)) = location {
+        return Ok(
+            loc_key(conn, schema, location)?.map(|key| SourceContent::Location(key, kind, ticks))
+        );
+    }
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT m.FilePath, m.Hash, im.DurationTicks
+                 FROM {schema}.PlaylistItemIndependentMediaMap im
+                 JOIN {schema}.IndependentMedia m ON m.IndependentMediaId = im.IndependentMediaId
+                 WHERE im.PlaylistItemId = ?1 ORDER BY im.IndependentMediaId LIMIT 1"
+            ),
+            [item],
+            |r| Ok(SourceContent::Media(r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?)
+}
+
+fn marker_content(conn: &Connection, schema: &str, item: i64) -> Result<Vec<MarkerContent>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT PlaylistItemMarkerId, Label, StartTimeTicks, DurationTicks,
+                EndTransitionDurationTicks
+         FROM {schema}.PlaylistItemMarker WHERE PlaylistItemId = ?1
+         ORDER BY StartTimeTicks, PlaylistItemMarkerId"
+    ))?;
+    let markers = stmt
+        .query_map([item], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                MarkerContent {
+                    label: r.get(1)?,
+                    start: r.get(2)?,
+                    duration: r.get(3)?,
+                    end_transition: r.get(4)?,
+                    verses: Vec::new(),
+                    paragraphs: Vec::new(),
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut verses = conn.prepare(&format!(
+        "SELECT VerseId FROM {schema}.PlaylistItemMarkerBibleVerseMap
+         WHERE PlaylistItemMarkerId = ?1 ORDER BY VerseId"
+    ))?;
+    let mut paragraphs = conn.prepare(&format!(
+        "SELECT MepsDocumentId, ParagraphIndex, MarkerIndexWithinParagraph
+         FROM {schema}.PlaylistItemMarkerParagraphMap WHERE PlaylistItemMarkerId = ?1
+         ORDER BY MepsDocumentId, ParagraphIndex, MarkerIndexWithinParagraph"
+    ))?;
+    markers
+        .into_iter()
+        .map(|(id, mut marker)| {
+            marker.verses = verses
+                .query_map([id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            marker.paragraphs = paragraphs
+                .query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            Ok(marker)
+        })
+        .collect()
+}
+
+/// Fixed entries of a `.jwlplaylist` / `.jwlibrary` zip; a media file of
+/// the same name would collide with them.
+const RESERVED_NAMES: [&str; 3] = ["manifest.json", "userData.db", "default_thumbnail.png"];
+
+/// A plain file name: 1..=128 chars, none of `/ \ :` or NUL, not starting
+/// with `.`, and none of the [`RESERVED_NAMES`] (ignoring case).
 pub fn safe_media_name(name: &str) -> bool {
     let len = name.chars().count();
-    (1..=128).contains(&len) && !name.starts_with('.') && !name.contains(['/', '\\', ':', '\0'])
+    (1..=128).contains(&len)
+        && !name.starts_with('.')
+        && !name.contains(['/', '\\', ':', '\0'])
+        && !RESERVED_NAMES.iter().any(|r| r.eq_ignore_ascii_case(name))
 }
 
 /// SHA-256, each byte as hex without zero padding (iOS JW Library).
@@ -210,6 +376,20 @@ mod tests {
         assert!(!safe_media_name("a\0b"));
         assert!(!safe_media_name(&"a".repeat(129)));
         assert!(safe_media_name(&"a".repeat(128)));
+        // The fixed entries of a .jwlplaylist / .jwlibrary zip.
+        for reserved in [
+            "manifest.json",
+            "userData.db",
+            "default_thumbnail.png",
+            "MANIFEST.JSON",
+            "userdata.db",
+            "Default_Thumbnail.PNG",
+        ] {
+            assert!(!safe_media_name(reserved), "{reserved}");
+        }
+        assert!(safe_media_name("manifest.json.png"));
+        assert!(safe_media_name("userData.db.jpeg"));
+        assert!(safe_media_name("06D2E671-01A0-49C8-9642-DCFA28BF20E7.png"));
     }
 
     #[test]

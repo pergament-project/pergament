@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -131,6 +131,35 @@ fn hash(content: &impl Serialize) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(content)?)))
 }
 
+/// The `Location` columns of a [`LocKey`], normalized; read with [`loc_key_at`].
+const LOC_KEY_COLUMNS: &str = "Type, KeySymbol, MepsLanguage, IFNULL(IssueTagNumber, 0),
+    IFNULL(DocumentId, 0), IFNULL(BookNumber, 0), IFNULL(ChapterNumber, 0), Track";
+
+/// The key in the [`LOC_KEY_COLUMNS`] of row `r`, starting at column `at`.
+fn loc_key_at(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<LocKey> {
+    Ok(LocKey {
+        kind: r.get(at)?,
+        key_symbol: r.get(at + 1)?,
+        meps_language: r.get(at + 2)?,
+        issue_tag: r.get(at + 3)?,
+        document_id: r.get(at + 4)?,
+        book: r.get(at + 5)?,
+        chapter: r.get(at + 6)?,
+        track: r.get(at + 7)?,
+    })
+}
+
+/// The key of `Location` `id` in database `schema` ("main" or "inc").
+pub(crate) fn loc_key(conn: &Connection, schema: &str, id: i64) -> Result<Option<LocKey>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {LOC_KEY_COLUMNS} FROM {schema}.Location WHERE LocationId = ?1"),
+            [id],
+            |r| loc_key_at(r, 0),
+        )
+        .optional()?)
+}
+
 fn has_table(conn: &Connection, table: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -148,26 +177,10 @@ pub(crate) fn rows_of(conn: &Connection) -> Result<Rows> {
     };
 
     let locations: HashMap<i64, LocKey> = {
-        let mut stmt = conn.prepare(
-            "SELECT LocationId, Type, KeySymbol, MepsLanguage, IFNULL(IssueTagNumber, 0),
-                    IFNULL(DocumentId, 0), IFNULL(BookNumber, 0), IFNULL(ChapterNumber, 0), Track
-             FROM Location",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                LocKey {
-                    kind: r.get(1)?,
-                    key_symbol: r.get(2)?,
-                    meps_language: r.get(3)?,
-                    issue_tag: r.get(4)?,
-                    document_id: r.get(5)?,
-                    book: r.get(6)?,
-                    chapter: r.get(7)?,
-                    track: r.get(8)?,
-                },
-            ))
-        })?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT LocationId, {LOC_KEY_COLUMNS} FROM Location"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, loc_key_at(r, 1)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     let loc = |id: Option<i64>| id.and_then(|id| locations.get(&id).cloned());
