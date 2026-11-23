@@ -70,6 +70,18 @@ pub enum ItemSource {
     },
 }
 
+/// A recording of a publication to add to a playlist.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryRef {
+    pub key_symbol: String,
+    pub track: i64,
+    pub issue_tag: i64,
+    pub meps_language: i64,
+    /// Audio or Video.
+    pub kind: ItemKind,
+}
+
 /// One item of a playlist.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]

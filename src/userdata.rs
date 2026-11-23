@@ -14,8 +14,8 @@ use zip::ZipArchive;
 use zip::write::SimpleFileOptions;
 
 use crate::playlist::{
-    ItemKind, ItemSource, MEDIA_DIR, Playlist, PlaylistItemInfo, PlaylistSummary, kind_of_mime,
-    safe_media_name,
+    ItemKind, ItemSource, LibraryRef, MEDIA_DIR, PHOTO_TICKS, Playlist, PlaylistItemInfo,
+    PlaylistSummary, copy_hashed, file_type, ios_hash, kind_of_mime, safe_media_name,
 };
 use crate::sync_snapshot::{
     DeleteGuard, Plan, Resolver, RowKey, RowRef, Side, Snapshot, SyncMerge, SyncOutcome, classify,
@@ -1388,14 +1388,7 @@ impl UserData {
     /// used is deleted.
     pub fn remove_playlist_item(&mut self, item: i64) -> Result<()> {
         let tx = self.conn.transaction()?;
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM PlaylistItem WHERE PlaylistItemId = ?1)",
-            [item],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            return Err(Error::NotFound(format!("playlist item {item}")));
-        }
+        item_exists(&tx, item)?;
         let tags = {
             let mut stmt = tx.prepare("SELECT TagId FROM TagMap WHERE PlaylistItemId = ?1")?;
             stmt.query_map([item], |r| r.get::<_, i64>(0))?
@@ -1411,6 +1404,188 @@ impl UserData {
         tx.commit()?;
         remove_media_files(&self.playlist_media_dir(), &removed);
         Ok(())
+    }
+
+    /// Append a recording of a publication to `playlist`: Location Type 2 and
+    /// MajorMultimediaType 0 for audio, Type 3 and 2 for video. Returns the
+    /// item id.
+    pub fn add_library_item(
+        &mut self,
+        playlist: i64,
+        item: &LibraryRef,
+        label: &str,
+        duration_ticks: i64,
+    ) -> Result<i64> {
+        let (location_type, multimedia_type) = match item.kind {
+            ItemKind::Audio => (2, 0),
+            ItemKind::Video => (3, 2),
+            ItemKind::Image => {
+                return Err(Error::Invalid("a library item is audio or video".into()));
+            }
+        };
+        let label = item_label(label)?;
+        if duration_ticks < 0 {
+            return Err(Error::Invalid(format!(
+                "duration {duration_ticks} is negative"
+            )));
+        }
+        let tx = self.conn.transaction()?;
+        playlist_name_of(&tx, playlist)?;
+        let found: Option<i64> = tx
+            .query_row(
+                "SELECT LocationId FROM Location
+                 WHERE BookNumber IS NULL AND ChapterNumber IS NULL AND DocumentId IS NULL
+                   AND KeySymbol = ?1 AND Track = ?2 AND IFNULL(IssueTagNumber, 0) = ?3
+                   AND MepsLanguage = ?4 AND Type = ?5
+                 ORDER BY LocationId LIMIT 1",
+                params![
+                    item.key_symbol,
+                    item.track,
+                    item.issue_tag,
+                    item.meps_language,
+                    location_type
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let location = match found {
+            Some(id) => id,
+            None => {
+                tx.execute(
+                    "INSERT INTO Location (KeySymbol, Track, IssueTagNumber, MepsLanguage, Type)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        item.key_symbol,
+                        item.track,
+                        item.issue_tag,
+                        item.meps_language,
+                        location_type
+                    ],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        let id = append_item(&tx, playlist, label)?;
+        tx.execute(
+            "INSERT INTO PlaylistItemLocationMap
+             (PlaylistItemId, LocationId, MajorMultimediaType, BaseDurationTicks)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, location, multimedia_type, duration_ticks],
+        )?;
+        touch(&tx)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Copy `src` into the media directory and append it to `playlist`,
+    /// labelled with its file name. Photos last `PHOTO_TICKS`; audio and
+    /// video start at 0 until [`Self::set_playlist_item_duration`]. Returns
+    /// the item id.
+    pub fn add_file_item(&mut self, playlist: i64, src: &Path) -> Result<i64> {
+        file_item_type(src)?;
+        playlist_name_of(&self.conn, playlist)?;
+        let staged = stage_file_item(&self.playlist_media_dir(), src)?;
+        self.add_staged_file(playlist, staged)
+    }
+
+    /// Append a file copied by [`stage_file_item`] to `playlist`, in one
+    /// transaction. Returns the item id; on any error the copy is removed.
+    pub fn add_staged_file(&mut self, playlist: i64, mut staged: StagedFile) -> Result<i64> {
+        let tx = self.conn.transaction()?;
+        playlist_name_of(&tx, playlist)?;
+        tx.execute(
+            "INSERT INTO IndependentMedia (OriginalFilename, FilePath, MimeType, Hash)
+             VALUES (?1, ?1, ?2, ?3)",
+            params![staged.name, staged.mime, staged.hash],
+        )?;
+        let media = tx.last_insert_rowid();
+        let id = append_item(&tx, playlist, &staged.label)?;
+        tx.execute(
+            "INSERT INTO PlaylistItemIndependentMediaMap
+             (PlaylistItemId, IndependentMediaId, DurationTicks) VALUES (?1, ?2, ?3)",
+            params![id, media, staged.ticks],
+        )?;
+        touch(&tx)?;
+        tx.commit()?;
+        staged.added = true;
+        Ok(id)
+    }
+
+    /// Set the length of a file item's audio or video, as measured by the UI.
+    /// A photo or a library item is `Error::Invalid`.
+    pub fn set_playlist_item_duration(&mut self, item: i64, ticks: i64) -> Result<()> {
+        if ticks < 0 {
+            return Err(Error::Invalid(format!("duration {ticks} is negative")));
+        }
+        let tx = self.conn.transaction()?;
+        item_exists(&tx, item)?;
+        let mime: Option<String> = tx
+            .query_row(
+                "SELECT m.MimeType FROM PlaylistItemIndependentMediaMap im
+                 JOIN IndependentMedia m ON m.IndependentMediaId = im.IndependentMediaId
+                 WHERE im.PlaylistItemId = ?1",
+                [item],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match mime.as_deref().and_then(kind_of_mime) {
+            Some(ItemKind::Audio | ItemKind::Video) => {}
+            _ => {
+                return Err(Error::Invalid(format!(
+                    "playlist item {item} is not an audio or video file"
+                )));
+            }
+        }
+        tx.execute(
+            "UPDATE PlaylistItemIndependentMediaMap SET DurationTicks = ?1
+             WHERE PlaylistItemId = ?2",
+            params![ticks, item],
+        )?;
+        touch(&tx)?;
+        Ok(tx.commit()?)
+    }
+
+    /// Store `jpeg` (at most 2 MiB) as the thumbnail of `item`. The old
+    /// thumbnail is deleted when nothing else uses it.
+    pub fn set_playlist_item_thumbnail(&mut self, item: i64, jpeg: &[u8]) -> Result<()> {
+        if jpeg.len() > MAX_THUMBNAIL {
+            return Err(Error::TooLarge(format!(
+                "thumbnail exceeds {MAX_THUMBNAIL} bytes"
+            )));
+        }
+        item_exists(&self.conn, item)?;
+        let dir = self.playlist_media_dir();
+        fs::create_dir_all(&dir)?;
+        let name = new_guid(&self.conn)?;
+        let digest = copy_hashed(&mut &jpeg[..], &dir.join(&name))?;
+
+        let mut write = || -> Result<Vec<String>> {
+            let tx = self.conn.transaction()?;
+            item_exists(&tx, item)?;
+            tx.execute(
+                "INSERT INTO IndependentMedia (OriginalFilename, FilePath, MimeType, Hash)
+                 VALUES (?1, ?1, 'image/jpeg', ?2)",
+                params![name, ios_hash(&digest)],
+            )?;
+            tx.execute(
+                "UPDATE PlaylistItem SET ThumbnailFilePath = ?1 WHERE PlaylistItemId = ?2",
+                params![name, item],
+            )?;
+            let removed = remove_orphan_media(&tx)?;
+            touch(&tx)?;
+            tx.commit()?;
+            Ok(removed)
+        };
+        match write() {
+            Ok(removed) => {
+                remove_media_files(&dir, &removed);
+                Ok(())
+            }
+            Err(e) => {
+                remove_media_files(&dir, std::slice::from_ref(&name));
+                Err(e)
+            }
+        }
     }
 
     /// Move `item` to 0-based `position` within `playlist`.
@@ -3146,6 +3321,78 @@ pub(crate) fn check_database(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A media file copied into the media directory but not yet in the
+/// database (see [`stage_file_item`]). Dropping it before
+/// [`UserData::add_staged_file`] commits removes the file.
+#[derive(Debug)]
+pub struct StagedFile {
+    dir: PathBuf,
+    /// `FilePath`: the GUID plus the lowercase extension.
+    name: String,
+    mime: &'static str,
+    /// `Hash` column value.
+    hash: String,
+    label: String,
+    ticks: i64,
+    added: bool,
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if !self.added {
+            remove_media_files(&self.dir, std::slice::from_ref(&self.name));
+        }
+    }
+}
+
+/// Kind, MIME type and lowercase extension of the media file `src`;
+/// `Invalid` when it is not one.
+fn file_item_type(src: &Path) -> Result<(ItemKind, &'static str, String)> {
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let (kind, mime) = file_type(&ext)
+        .ok_or_else(|| Error::Invalid(format!("{} is not a media file", src.display())))?;
+    Ok((kind, mime, ext))
+}
+
+/// The first half of [`UserData::add_file_item`], which needs no database:
+/// check `src`, copy it into the media directory `dir` (at most
+/// `MAX_MEDIA` bytes, through a `.part` file) under a new GUID name and hash
+/// it. Labelled with its file name; photos last `PHOTO_TICKS`, audio and
+/// video 0.
+pub fn stage_file_item(dir: &Path, src: &Path) -> Result<StagedFile> {
+    let (kind, mime, ext) = file_item_type(src)?;
+    let label = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let label = item_label(&label)?.to_owned();
+    let ticks = if kind == ItemKind::Image {
+        PHOTO_TICKS
+    } else {
+        0
+    };
+    // A private connection only as a random source, so the user data stays free.
+    let guid = new_guid(&Connection::open_in_memory()?)?;
+    let name = format!("{guid}.{ext}");
+    debug_assert!(safe_media_name(&name));
+    let mut file = File::open(src)?;
+    fs::create_dir_all(dir)?;
+    let digest = copy_hashed(&mut file, &dir.join(&name))?;
+    Ok(StagedFile {
+        dir: dir.to_owned(),
+        name,
+        mime,
+        hash: ios_hash(&digest),
+        label,
+        ticks,
+        added: false,
+    })
+}
+
 /// Random uppercase UUID (version 4), like the ones JW Library writes.
 fn new_guid(conn: &Connection) -> Result<String> {
     let mut bytes: Vec<u8> = conn.query_row("SELECT randomblob(16)", [], |r| r.get(0))?;
@@ -3198,6 +3445,48 @@ fn new_playlist_name(conn: &Connection, name: &str, except: Option<i64>) -> Resu
         return Err(Error::Invalid(format!("playlist {name:?} already exists")));
     }
     Ok(name.to_owned())
+}
+
+/// Largest accepted thumbnail (2 MiB).
+const MAX_THUMBNAIL: usize = 2 << 20;
+
+/// `NotFound` unless playlist item `item` exists.
+fn item_exists(conn: &Connection, item: i64) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM PlaylistItem WHERE PlaylistItemId = ?1)",
+        [item],
+        |r| r.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(Error::NotFound(format!("playlist item {item}")))
+    }
+}
+
+/// `label` trimmed; `Invalid` when empty (JW Library needs a label).
+fn item_label(label: &str) -> Result<&str> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Err(Error::Invalid("a playlist item needs a label".into()));
+    }
+    Ok(label)
+}
+
+/// Insert a `PlaylistItem` (Accuracy 1, EndAction 0, no trims) at the end of
+/// `playlist`; returns its id.
+fn append_item(tx: &Transaction<'_>, playlist: i64, label: &str) -> Result<i64> {
+    tx.execute(
+        "INSERT INTO PlaylistItem (Label, Accuracy, EndAction) VALUES (?1, 1, 0)",
+        [label],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO TagMap (PlaylistItemId, TagId, Position)
+         VALUES (?1, ?2, (SELECT IFNULL(max(Position), -1) + 1 FROM TagMap WHERE TagId = ?2))",
+        params![id, playlist],
+    )?;
+    Ok(id)
 }
 
 /// `TagMap` rows of `tag` by `Position`: `(TagMapId, PlaylistItemId)`.
@@ -6588,7 +6877,7 @@ mod tests {
 
     mod playlists {
         use super::*;
-        use crate::playlist::{ItemKind, ItemSource, PlaylistSummary};
+        use crate::playlist::{ItemKind, ItemSource, LibraryRef, PlaylistSummary, ios_hash};
 
         fn open(tmp: &Path) -> UserData {
             UserData::open(tmp.join(DB_NAME)).unwrap()
@@ -6920,7 +7209,385 @@ mod tests {
             library_item(&ud, tag, 1, 2, 2);
             check(&mut ud, &|ud| ud.move_playlist_item(tag, a, 1).unwrap());
             check(&mut ud, &|ud| ud.remove_playlist_item(a).unwrap());
+            check(&mut ud, &|ud| {
+                ud.add_library_item(tag, &song("sjjm", ItemKind::Audio), "Song", 1)
+                    .unwrap();
+            });
+            let mov = ud.path().with_file_name("clip.mov");
+            fs::write(&mov, b"moov").unwrap();
+            check(&mut ud, &|ud| {
+                ud.add_file_item(tag, &mov).unwrap();
+            });
+            let video = item_ids(&ud, tag)[2];
+            check(&mut ud, &|ud| {
+                ud.set_playlist_item_duration(video, 9).unwrap()
+            });
+            check(&mut ud, &|ud| {
+                ud.set_playlist_item_thumbnail(video, b"jpeg").unwrap()
+            });
             check(&mut ud, &|ud| ud.delete_playlist(tag).unwrap());
+        }
+
+        fn song(key_symbol: &str, kind: ItemKind) -> LibraryRef {
+            LibraryRef {
+                key_symbol: key_symbol.into(),
+                track: 1,
+                issue_tag: 0,
+                meps_language: 2,
+                kind,
+            }
+        }
+
+        /// `(Type, Track, KeySymbol, MepsLanguage, IssueTagNumber)` of every Location.
+        fn locations(ud: &UserData) -> Vec<(i64, i64, String, i64, i64)> {
+            let mut stmt = ud
+                .conn
+                .prepare(
+                    "SELECT Type, Track, KeySymbol, MepsLanguage, IssueTagNumber
+                     FROM Location ORDER BY LocationId",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        }
+
+        /// `(MajorMultimediaType, BaseDurationTicks)` of `item`.
+        fn location_map(ud: &UserData, item: i64) -> (i64, i64) {
+            ud.conn
+                .query_row(
+                    "SELECT MajorMultimediaType, BaseDurationTicks
+                     FROM PlaylistItemLocationMap WHERE PlaylistItemId = ?1",
+                    [item],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        }
+
+        /// `(Label, Accuracy, EndAction, StartTrim, EndTrim)` of `item`.
+        fn item_row(ud: &UserData, item: i64) -> (String, i64, i64, Option<i64>, Option<i64>) {
+            ud.conn
+                .query_row(
+                    "SELECT Label, Accuracy, EndAction, StartTrimOffsetTicks, EndTrimOffsetTicks
+                     FROM PlaylistItem WHERE PlaylistItemId = ?1",
+                    [item],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn adds_library_audio_like_jw_library() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Songs").unwrap();
+            let label = "1. Jehovas großartige Eigenschaften";
+            let a = ud
+                .add_library_item(tag, &song("sjjm", ItemKind::Audio), label, 1_378_840_000)
+                .unwrap();
+            assert_eq!(locations(&ud), [(2, 1, "sjjm".into(), 2, 0)]);
+            assert_eq!(location_map(&ud, a), (0, 1_378_840_000));
+            assert_eq!(item_row(&ud, a), (label.into(), 1, 0, None, None));
+            assert_eq!(positions(&ud, tag), [(a, 0)]);
+
+            let b = ud
+                .add_library_item(tag, &song("sjjm", ItemKind::Audio), label, 1_378_840_000)
+                .unwrap();
+            assert_eq!(locations(&ud).len(), 1);
+            assert_eq!(positions(&ud, tag), [(a, 0), (b, 1)]);
+            let items = ud.playlist(tag).unwrap().items;
+            assert_eq!(items[1].kind, ItemKind::Audio);
+            assert_eq!(items[1].duration_ticks, 1_378_840_000);
+
+            assert!(is_invalid(ud.add_library_item(
+                tag,
+                &song("sjjm", ItemKind::Audio),
+                " ",
+                0
+            )));
+            assert!(is_invalid(ud.add_library_item(
+                tag,
+                &song("sjjm", ItemKind::Image),
+                label,
+                0
+            )));
+            assert!(matches!(
+                ud.add_library_item(999, &song("sjjm", ItemKind::Audio), label, 0),
+                Err(Error::NotFound(_))
+            ));
+            assert_eq!(count(&ud, "PlaylistItem"), 2);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn adds_library_video() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Videos").unwrap();
+            let a = ud
+                .add_library_item(
+                    tag,
+                    &song("jwb-143", ItemKind::Video),
+                    "JW Broadcasting November 2026",
+                    36_009_720_000,
+                )
+                .unwrap();
+            assert_eq!(locations(&ud), [(3, 1, "jwb-143".into(), 2, 0)]);
+            assert_eq!(location_map(&ud, a), (2, 36_009_720_000));
+            assert_eq!(ud.playlist(tag).unwrap().items[0].kind, ItemKind::Video);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        /// `(OriginalFilename, FilePath, MimeType, Hash, DurationTicks)` of file item `item`.
+        fn media_of(ud: &UserData, item: i64) -> (String, String, String, String, i64) {
+            ud.conn
+                .query_row(
+                    "SELECT m.OriginalFilename, m.FilePath, m.MimeType, m.Hash, im.DurationTicks
+                     FROM PlaylistItemIndependentMediaMap im
+                     JOIN IndependentMedia m ON m.IndependentMediaId = im.IndependentMediaId
+                     WHERE im.PlaylistItemId = ?1",
+                    [item],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap()
+        }
+
+        fn is_guid_name(name: &str, ext: &str) -> bool {
+            let Some(guid) = name.strip_suffix(ext) else {
+                return false;
+            };
+            guid.len() == 36
+                && guid
+                    .chars()
+                    .all(|c| c == '-' || c.is_ascii_digit() || ('A'..='F').contains(&c))
+        }
+
+        #[test]
+        fn adds_own_files() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Mine").unwrap();
+            let src = tmp.path().join("src");
+            fs::create_dir_all(&src).unwrap();
+
+            let txt = src.join("notes.txt");
+            fs::write(&txt, b"text").unwrap();
+            assert!(is_invalid(ud.add_file_item(tag, &txt)));
+            assert_eq!(count(&ud, "PlaylistItem"), 0);
+            assert_eq!(count(&ud, "IndependentMedia"), 0);
+            assert_eq!(count(&ud, "TagMap"), 0);
+            let dir = ud.playlist_media_dir();
+            assert!(!dir.exists() || fs::read_dir(&dir).unwrap().next().is_none());
+
+            let png = src.join("IMG_3019.PNG");
+            let content = b"\x89PNG not really".to_vec();
+            fs::write(&png, &content).unwrap();
+            let photo = ud.add_file_item(tag, &png).unwrap();
+            assert_eq!(
+                item_row(&ud, photo),
+                ("IMG_3019.PNG".into(), 1, 0, None, None)
+            );
+            let (original, path, mime, hash, ticks) = media_of(&ud, photo);
+            assert!(is_guid_name(&original, ".png"), "{original}");
+            assert!(is_guid_name(&path, ".png"), "{path}");
+            assert_eq!(mime, "image/png");
+            assert_eq!(hash, ios_hash(&Sha256::digest(&content)));
+            assert_eq!(ticks, 40_000_000);
+            assert_eq!(fs::read(dir.join(&path)).unwrap(), content);
+
+            let mov = src.join("IMG_2974.mov");
+            fs::write(&mov, b"moov").unwrap();
+            let video = ud.add_file_item(tag, &mov).unwrap();
+            assert_eq!(media_of(&ud, video).2, "video/quicktime");
+            assert_eq!(media_of(&ud, video).4, 0);
+            ud.set_playlist_item_duration(video, 139_000_000).unwrap();
+            assert_eq!(media_of(&ud, video).4, 139_000_000);
+            let items = ud.playlist(tag).unwrap().items;
+            assert_eq!(items[1].kind, ItemKind::Video);
+            assert_eq!(items[1].duration_ticks, 139_000_000);
+            assert_eq!(positions(&ud, tag), [(photo, 0), (video, 1)]);
+
+            assert!(is_invalid(ud.set_playlist_item_duration(photo, 1)));
+            assert_eq!(media_of(&ud, photo).4, 40_000_000);
+            let song = ud
+                .add_library_item(tag, &song("sjjm", ItemKind::Audio), "Song", 5)
+                .unwrap();
+            assert!(is_invalid(ud.set_playlist_item_duration(song, 1)));
+            assert!(matches!(
+                ud.set_playlist_item_duration(999, 1),
+                Err(Error::NotFound(_))
+            ));
+            assert!(matches!(
+                ud.add_file_item(999, &png),
+                Err(Error::NotFound(_))
+            ));
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn file_item_db_failure_removes_the_copy() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Mine").unwrap();
+            let png = tmp.path().join("a.png");
+            fs::write(&png, b"png").unwrap();
+            ud.conn
+                .execute_batch(
+                    "CREATE TRIGGER no_media BEFORE INSERT ON IndependentMedia
+                     BEGIN SELECT RAISE(ABORT, 'no'); END;",
+                )
+                .unwrap();
+            assert!(matches!(ud.add_file_item(tag, &png), Err(Error::Sqlite(_))));
+            let dir = ud.playlist_media_dir();
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            assert_eq!(count(&ud, "PlaylistItem"), 0);
+        }
+
+        #[test]
+        fn staged_file_is_copied_without_the_database() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Mine").unwrap();
+            let dir = ud.playlist_media_dir();
+            let png = tmp.path().join("IMG_1.PNG");
+            fs::write(&png, b"png bytes").unwrap();
+            let txt = tmp.path().join("notes.txt");
+            fs::write(&txt, b"text").unwrap();
+            assert!(is_invalid(stage_file_item(&dir, &txt)));
+            assert!(!dir.exists() || fs::read_dir(&dir).unwrap().next().is_none());
+
+            let staged = stage_file_item(&dir, &png).unwrap();
+            let files: Vec<String> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            assert_eq!(files.len(), 1);
+            assert!(is_guid_name(&files[0], ".png"), "{}", files[0]);
+            assert_eq!(count(&ud, "PlaylistItem"), 0, "nothing written yet");
+
+            let item = ud.add_staged_file(tag, staged).unwrap();
+            let (original, path, mime, hash, ticks) = media_of(&ud, item);
+            assert_eq!((&original, &path), (&files[0], &files[0]));
+            assert_eq!(mime, "image/png");
+            assert_eq!(hash, ios_hash(&Sha256::digest(b"png bytes")));
+            assert_eq!(ticks, 40_000_000);
+            assert_eq!(item_row(&ud, item).0, "IMG_1.PNG");
+            assert_eq!(fs::read(dir.join(&path)).unwrap(), b"png bytes");
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn staged_file_is_removed_when_the_transaction_fails() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Mine").unwrap();
+            let dir = ud.playlist_media_dir();
+            let png = tmp.path().join("a.png");
+            fs::write(&png, b"png").unwrap();
+
+            // The playlist is deleted while the file is copied.
+            let staged = stage_file_item(&dir, &png).unwrap();
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+            ud.delete_playlist(tag).unwrap();
+            assert!(matches!(
+                ud.add_staged_file(tag, staged),
+                Err(Error::NotFound(_))
+            ));
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+            let tag = ud.create_playlist("Mine").unwrap();
+            ud.conn
+                .execute_batch(
+                    "CREATE TRIGGER no_item BEFORE INSERT ON TagMap
+                     BEGIN SELECT RAISE(ABORT, 'no'); END;",
+                )
+                .unwrap();
+            let staged = stage_file_item(&dir, &png).unwrap();
+            assert!(matches!(
+                ud.add_staged_file(tag, staged),
+                Err(Error::Sqlite(_))
+            ));
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            assert_eq!(count(&ud, "PlaylistItem"), 0);
+            assert_eq!(count(&ud, "IndependentMedia"), 0);
+
+            // A staged file that is never added is removed too.
+            drop(stage_file_item(&dir, &png).unwrap());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        }
+
+        fn thumbnail_of(ud: &UserData, item: i64) -> Option<String> {
+            ud.conn
+                .query_row(
+                    "SELECT ThumbnailFilePath FROM PlaylistItem WHERE PlaylistItemId = ?1",
+                    [item],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn thumbnail_replaces_old() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Songs").unwrap();
+            let item = ud
+                .add_library_item(tag, &song("sjjm", ItemKind::Audio), "Song", 5)
+                .unwrap();
+            let dir = ud.playlist_media_dir();
+
+            ud.set_playlist_item_thumbnail(item, b"first jpeg").unwrap();
+            let first = thumbnail_of(&ud, item).unwrap();
+            assert!(is_guid_name(&first, ""), "{first}");
+            assert_eq!(fs::read(dir.join(&first)).unwrap(), b"first jpeg");
+
+            let second_bytes = b"second jpeg";
+            ud.set_playlist_item_thumbnail(item, second_bytes).unwrap();
+            let second = thumbnail_of(&ud, item).unwrap();
+            assert_ne!(first, second);
+            assert!(!dir.join(&first).exists());
+            assert_eq!(fs::read(dir.join(&second)).unwrap(), second_bytes);
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+            let row: (String, String, String, String) = ud
+                .conn
+                .query_row(
+                    "SELECT OriginalFilename, FilePath, MimeType, Hash FROM IndependentMedia",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                row,
+                (
+                    second.clone(),
+                    second.clone(),
+                    "image/jpeg".into(),
+                    ios_hash(&Sha256::digest(second_bytes))
+                )
+            );
+            assert_eq!(count(&ud, "IndependentMedia"), 1);
+            assert_eq!(
+                ud.playlist(tag).unwrap().items[0].thumbnail,
+                Some(dir.join(&second))
+            );
+
+            let big = vec![0u8; 2 * 1024 * 1024 + 1];
+            assert!(matches!(
+                ud.set_playlist_item_thumbnail(item, &big),
+                Err(Error::TooLarge(_))
+            ));
+            assert_eq!(thumbnail_of(&ud, item), Some(second.clone()));
+            assert!(matches!(
+                ud.set_playlist_item_thumbnail(999, b"x"),
+                Err(Error::NotFound(_))
+            ));
+            assert_eq!(count(&ud, "IndependentMedia"), 1);
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+            assert_foreign_keys_hold(&ud);
         }
     }
 
