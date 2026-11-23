@@ -34,6 +34,68 @@ pub enum ItemKind {
     Image,
 }
 
+/// A playlist in the list of playlists.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistSummary {
+    /// `Tag.TagId`.
+    pub id: i64,
+    pub name: String,
+    pub items: i64,
+    pub duration_ticks: i64,
+    /// The first item's thumbnail.
+    pub thumbnail: Option<PathBuf>,
+}
+
+/// Where an item's media comes from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum ItemSource {
+    /// A recording of a publication (`PlaylistItemLocationMap`).
+    #[serde(rename_all = "camelCase")]
+    Library {
+        key_symbol: String,
+        track: i64,
+        issue_tag: i64,
+        meps_language: i64,
+        kind: ItemKind,
+    },
+    /// A file in the media directory (`PlaylistItemIndependentMediaMap`).
+    #[serde(rename_all = "camelCase")]
+    File {
+        path: PathBuf,
+        mime: String,
+        /// Whether the file exists.
+        available: bool,
+    },
+}
+
+/// One item of a playlist.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistItemInfo {
+    /// `PlaylistItem.PlaylistItemId`.
+    pub id: i64,
+    pub label: String,
+    pub kind: ItemKind,
+    pub duration_ticks: i64,
+    pub start_trim_ticks: Option<i64>,
+    pub end_trim_ticks: Option<i64>,
+    pub end_action: i64,
+    /// Only when the file exists.
+    pub thumbnail: Option<PathBuf>,
+    pub source: ItemSource,
+}
+
+/// A playlist with its items in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Playlist {
+    pub id: i64,
+    pub name: String,
+    pub items: Vec<PlaylistItemInfo>,
+}
+
 /// A plain file name: 1..=128 chars, none of `/ \ :` or NUL, not starting with `.`.
 pub fn safe_media_name(name: &str) -> bool {
     let len = name.chars().count();
