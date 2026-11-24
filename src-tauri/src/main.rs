@@ -9,6 +9,15 @@ fn main() {
         // SAFETY: called before any other thread is started.
         unsafe { std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1") };
     }
+    // WebKitGTK's GStreamer player only accepts blob, data, file, http and https
+    // URLs and fails anything else with a format error before GStreamer sees it.
+    // Files from disk (playlist media, downloads) are served as asset:// URLs, so
+    // allow that scheme too. The tauri-asset GStreamer plugin then reads them.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_GST_ALLOWED_URI_PROTOCOLS").is_none() {
+        // SAFETY: called before any other thread is started.
+        unsafe { std::env::set_var("WEBKIT_GST_ALLOWED_URI_PROTOCOLS", "asset") };
+    }
     // With gst-plugins-bad installed, GStreamer prefers NVIDIA's hardware
     // decoders, and handing their output to WebKit takes the page down on
     // NVIDIA under Wayland. Software decoding is fast enough for these videos.

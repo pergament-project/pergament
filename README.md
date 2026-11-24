@@ -110,6 +110,12 @@ This also restores updates if your installed package still uses the old address.
 libsoup 3, OpenSSL and SQLite. Video needs `gst-libav` (`gstreamer1-libav` on
 Fedora); the packages above already include it.
 
+Videos and audio you add to a playlist from disk play only where GStreamer has
+the Tauri `asset://` plugin (`gst-plugin-tauri`). The Nix package includes it.
+The app already lets WebKitGTK use the `asset` scheme (`WEBKIT_GST_ALLOWED_URI_PROTOCOLS`).
+On the other Linux packages, playlist photos work and these files are added
+and listed, but they may not play until that plugin is installed.
+
 **Mac (Apple Silicon):** open the `.dmg` and drag Pergament to Applications.
 The app isn't signed, so the first time, right-click it and choose Open.
 
