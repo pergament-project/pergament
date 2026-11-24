@@ -5,6 +5,7 @@ import { api, type Bookmark, type BookmarkAnchor, type Loc, type Note, type TagI
 import { BOOKMARK_COLORS } from "@/components/bookmarks";
 import { cn } from "@/lib/utils";
 import { InlineNoteEditor, NoteCard, useCopyNote } from "@/components/notes";
+import { PlaylistsSection } from "@/components/playlists";
 import { ReadingPlansSection } from "@/components/reading-plans";
 import { Input } from "@/components/ui/input";
 import { HIGHLIGHT_COLORS } from "@/lib/marks";
@@ -99,6 +100,8 @@ export function PersonalView() {
           </p>
 
           <ReadingPlansSection />
+
+          <PlaylistsSection />
 
           <SectionTitle>Notes and Tags</SectionTitle>
           <button
