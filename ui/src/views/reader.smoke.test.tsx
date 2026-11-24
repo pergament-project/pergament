@@ -134,6 +134,27 @@ describe("Reader", () => {
     await waitFor(() => expect(screen.getByText("Verse one").classList.contains("selected")).toBe(true));
   });
 
+  it("selects the verse of a study note even when the study data arrives after the page", async () => {
+    let resolveStudy: ((value: unknown) => void) | null = null;
+    backend.chapter_study = () => new Promise((resolve) => { resolveStudy = resolve; });
+    render(
+      <StrictMode>
+        <AppProvider>
+          <ReaderView target={chapterTarget("nwtsty_E", 43, 3, 16)} note />
+        </AppProvider>
+      </StrictMode>,
+    );
+    await screen.findByText("For God loved the world");
+    await act(async () => {
+      resolveStudy?.({
+        outlineTitle: null,
+        outline: [],
+        verses: [{ chapter: 3, verse: 16, footnotes: [], xrefs: [], notes: ["<p>Study note</p>"] }],
+      });
+    });
+    await waitFor(() => expect(document.querySelector('[data-verse="3:16"]')?.classList.contains("selected")).toBe(true));
+  });
+
   it("does not flash verse one on an ordinary chapter open", async () => {
     const scroll = vi.fn();
     Element.prototype.scrollIntoView = scroll;

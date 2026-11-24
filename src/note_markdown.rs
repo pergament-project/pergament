@@ -225,9 +225,15 @@ impl<'a> Publications<'a> {
             if !languages.contains(&entry.meps_language) {
                 continue;
             }
-            let publication = Publication::open(library, &entry)?;
+            // A broken download must not fail every note.
+            let Some(publication) = Publication::open_or_log(library, &entry) else {
+                continue;
+            };
+            let Ok(key_symbol) = publication.key_symbol() else {
+                continue;
+            };
             let key = (
-                publication.key_symbol()?,
+                key_symbol,
                 entry.meps_language,
                 entry.issue_tag.parse::<i64>().unwrap_or(0),
             );
