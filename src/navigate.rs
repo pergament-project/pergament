@@ -18,7 +18,10 @@ pub struct Target {
 #[serde(rename_all = "camelCase")]
 pub enum TargetKind {
     Document(i64),
-    DocumentParagraph { document: i64, paragraph: i64 },
+    DocumentParagraph {
+        document: i64,
+        paragraph: i64,
+    },
     Chapter {
         book: i64,
         chapter: i64,
@@ -192,7 +195,10 @@ pub fn render(
             fragment: None,
             name: format!("{}-d{id}", entry.dir_name),
         },
-        TargetKind::DocumentParagraph { document, paragraph } => Page {
+        TargetKind::DocumentParagraph {
+            document,
+            paragraph,
+        } => Page {
             title: publication
                 .documents()?
                 .into_iter()

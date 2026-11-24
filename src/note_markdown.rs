@@ -2,13 +2,13 @@
 
 use std::collections::{HashMap, HashSet};
 
-use lol_html::{element, rewrite_str, RewriteStrSettings};
+use lol_html::{RewriteStrSettings, element, rewrite_str};
 use serde::Serialize;
 
 use crate::reader::VerseRef;
 use crate::render::reference_label;
-use crate::search_index::{extract_chapter_blocks, extract_document_blocks, IndexedBlock};
-use crate::userdata::{Loc, Note, BLOCK_PARAGRAPH, BLOCK_VERSE};
+use crate::search_index::{IndexedBlock, extract_chapter_blocks, extract_document_blocks};
+use crate::userdata::{BLOCK_PARAGRAPH, BLOCK_VERSE, Loc, Note};
 use crate::{Error, Library, Publication, Result};
 
 /// What a note quotes and where it belongs, resolved from its anchor.
@@ -108,11 +108,7 @@ pub fn utc_timestamp(ts: &str) -> Option<String> {
                 return None;
             }
             let minutes = h * 60 + m;
-            if *sign == b'-' {
-                -minutes
-            } else {
-                minutes
-            }
+            if *sign == b'-' { -minutes } else { minutes }
         }
         _ => return None,
     };

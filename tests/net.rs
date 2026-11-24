@@ -73,7 +73,9 @@ fn serve(body: Vec<u8>, fault: Fault) -> Server {
             }
             if fault == Fault::RedirectDisallowed && n == 0 {
                 let port = stream.local_addr().unwrap().port();
-                let response = format!("HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://localhost:{port}/target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
                 let _ = stream.write_all(response.as_bytes());
                 continue;
             }
@@ -86,8 +88,16 @@ fn serve(body: Vec<u8>, fault: Fault) -> Server {
                 continue;
             }
             if matches!(fault, Fault::FreshPartial | Fault::FreshComplete) && range.is_none() {
-                let len = if fault == Fault::FreshPartial { body.len() / 2 } else { body.len() };
-                let head = format!("HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n", len - 1, body.len());
+                let len = if fault == Fault::FreshPartial {
+                    body.len() / 2
+                } else {
+                    body.len()
+                };
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/{}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+                    len - 1,
+                    body.len()
+                );
                 let _ = stream.write_all(head.as_bytes());
                 let _ = stream.write_all(&body[..len]);
                 continue;
@@ -280,8 +290,15 @@ fn invalid_resumed_206_is_not_promoted() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("out");
     std::fs::write(part_path(&dest), b"old partial").unwrap();
-    let expected = Expected { md5: Some("irrelevant".into()), ..Expected::default() };
-    assert!(client().download(&srv.url, &dest, &expected, &mut |_, _| {}).is_err());
+    let expected = Expected {
+        md5: Some("irrelevant".into()),
+        ..Expected::default()
+    };
+    assert!(
+        client()
+            .download(&srv.url, &dest, &expected, &mut |_, _| {})
+            .is_err()
+    );
     assert!(!dest.exists());
     assert_eq!(std::fs::read(part_path(&dest)).unwrap(), b"old partial");
 }
@@ -293,8 +310,13 @@ fn unverified_existing_part_is_restarted() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("out");
     std::fs::write(part_path(&dest), vec![0; data.len()]).unwrap();
-    let expected = Expected { size: Some(data.len() as u64), ..Expected::default() };
-    client().download(&srv.url, &dest, &expected, &mut |_, _| {}).unwrap();
+    let expected = Expected {
+        size: Some(data.len() as u64),
+        ..Expected::default()
+    };
+    client()
+        .download(&srv.url, &dest, &expected, &mut |_, _| {})
+        .unwrap();
     assert_eq!(std::fs::read(dest).unwrap(), data);
     assert_eq!(srv.ranges.lock().unwrap()[0], None);
 }
@@ -306,7 +328,9 @@ fn unverified_part_does_not_trust_416() {
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("out");
     std::fs::write(part_path(&dest), b"stale").unwrap();
-    client().download(&srv.url, &dest, &Expected::default(), &mut |_, _| {}).unwrap();
+    client()
+        .download(&srv.url, &dest, &Expected::default(), &mut |_, _| {})
+        .unwrap();
     assert_eq!(std::fs::read(dest).unwrap(), data);
     assert_eq!(srv.ranges.lock().unwrap()[0], None);
 }
@@ -317,7 +341,9 @@ fn fresh_complete_206_is_accepted() {
     let srv = serve(data.clone(), Fault::FreshComplete);
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("out");
-    client().download(&srv.url, &dest, &Expected::default(), &mut |_, _| {}).unwrap();
+    client()
+        .download(&srv.url, &dest, &Expected::default(), &mut |_, _| {})
+        .unwrap();
     assert_eq!(std::fs::read(dest).unwrap(), data);
 }
 
@@ -327,7 +353,11 @@ fn fresh_incomplete_206_is_not_promoted() {
     let srv = serve(data, Fault::FreshPartial);
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("out");
-    assert!(client().download(&srv.url, &dest, &Expected::default(), &mut |_, _| {}).is_err());
+    assert!(
+        client()
+            .download(&srv.url, &dest, &Expected::default(), &mut |_, _| {})
+            .is_err()
+    );
     assert!(!dest.exists());
 }
 
@@ -337,7 +367,9 @@ fn follows_allowed_relative_redirect() {
     let srv = serve(data.clone(), Fault::RedirectRelative);
     let tmp = tempfile::tempdir().unwrap();
     let dest = tmp.path().join("out");
-    client().download(&srv.url, &dest, &Expected::default(), &mut |_, _| {}).unwrap();
+    client()
+        .download(&srv.url, &dest, &Expected::default(), &mut |_, _| {})
+        .unwrap();
     assert_eq!(std::fs::read(dest).unwrap(), data);
     assert_eq!(srv.requests.load(Ordering::SeqCst), 2);
 }
@@ -346,7 +378,16 @@ fn follows_allowed_relative_redirect() {
 fn rejects_redirect_before_contacting_disallowed_host() {
     let srv = serve(vec![1], Fault::RedirectDisallowed);
     let tmp = tempfile::tempdir().unwrap();
-    assert!(client().download(&srv.url, &tmp.path().join("out"), &Expected::default(), &mut |_, _| {}).is_err());
+    assert!(
+        client()
+            .download(
+                &srv.url,
+                &tmp.path().join("out"),
+                &Expected::default(),
+                &mut |_, _| {}
+            )
+            .is_err()
+    );
     assert_eq!(srv.requests.load(Ordering::SeqCst), 1);
 }
 

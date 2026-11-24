@@ -4,10 +4,10 @@ use std::fs;
 use std::path::Path;
 
 use common::Fixture;
-use pergament::note_export::{export, export_notes, note_file, ExportReport, NoteFile, MANIFEST};
-use pergament::note_markdown::Anchor;
-use pergament::userdata::{Loc, Note, NoteInput, UserData, BLOCK_VERSE};
 use pergament::Library;
+use pergament::note_export::{ExportReport, MANIFEST, NoteFile, export, export_notes, note_file};
+use pergament::note_markdown::Anchor;
+use pergament::userdata::{BLOCK_VERSE, Loc, Note, NoteInput, UserData};
 
 fn file(guid: &str, base: &str, contents: &str) -> NoteFile {
     NoteFile {

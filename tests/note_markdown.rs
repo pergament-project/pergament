@@ -1,8 +1,8 @@
 mod common;
 
 use common::Fixture;
-use pergament::note_markdown::{resolve, Anchor};
-use pergament::userdata::{Loc, BLOCK_PARAGRAPH, BLOCK_VERSE};
+use pergament::note_markdown::{Anchor, resolve};
+use pergament::userdata::{BLOCK_PARAGRAPH, BLOCK_VERSE, Loc};
 use pergament::{Library, Publication};
 
 #[test]

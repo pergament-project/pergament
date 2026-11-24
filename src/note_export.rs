@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::note_markdown::{
-    note_body_in, strip_app_links, tag_slug, utc_timestamp, Anchor, Publications,
+    Anchor, Publications, note_body_in, strip_app_links, tag_slug, utc_timestamp,
 };
 use crate::userdata::{Note, UserData};
 use crate::{Error, Library, Result};

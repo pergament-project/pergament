@@ -66,21 +66,28 @@ fn finish_block(state: &Rc<RefCell<ExtractionState>>) {
     }
 }
 
-fn extract(html: &str, selector: &'static str, block_for: impl Fn(&str) -> Option<IndexedBlock> + 'static) -> Result<ExtractedBlocks> {
+fn extract(
+    html: &str,
+    selector: &'static str,
+    block_for: impl Fn(&str) -> Option<IndexedBlock> + 'static,
+) -> Result<ExtractedBlocks> {
     let state = Rc::new(RefCell::new(ExtractionState::default()));
     let element_state = Rc::clone(&state);
     let text_state = Rc::clone(&state);
     let skip_state = Rc::clone(&state);
     let settings = RewriteStrSettings::new()
-        .append_element_content_handler(element!("style, script, span.cl, a.it, span.altsize, a.fn", move |el| {
-            skip_state.borrow_mut().skipped += 1;
-            let end_state = Rc::clone(&skip_state);
-            let _ = el.on_end_tag(end_tag!(move |_| {
-                end_state.borrow_mut().skipped -= 1;
+        .append_element_content_handler(element!(
+            "style, script, span.cl, a.it, span.altsize, a.fn",
+            move |el| {
+                skip_state.borrow_mut().skipped += 1;
+                let end_state = Rc::clone(&skip_state);
+                let _ = el.on_end_tag(end_tag!(move |_| {
+                    end_state.borrow_mut().skipped -= 1;
+                    Ok(())
+                }));
                 Ok(())
-            }));
-            Ok(())
-        }))
+            }
+        ))
         .append_element_content_handler(element!(selector, move |el| {
             let anchor = el
                 .get_attribute("data-pid")

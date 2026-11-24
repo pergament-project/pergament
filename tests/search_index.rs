@@ -1,4 +1,4 @@
-use pergament::search_index::{extract_chapter_blocks, extract_document_blocks, IndexedBlock};
+use pergament::search_index::{IndexedBlock, extract_chapter_blocks, extract_document_blocks};
 
 #[test]
 fn extracts_anchored_paragraphs_as_plain_text() {
@@ -35,7 +35,11 @@ fn extracts_anchored_paragraphs_as_plain_text() {
 
 #[test]
 fn standalone_headings_are_indexed_or_reported_unanchored() {
-    let result = extract_document_blocks(r#"<h1 data-pid="4">Anchored heading</h1><h2>Missing heading</h2>"#, 7).unwrap();
+    let result = extract_document_blocks(
+        r#"<h1 data-pid="4">Anchored heading</h1><h2>Missing heading</h2>"#,
+        7,
+    )
+    .unwrap();
 
     assert_eq!(result.blocks.len(), 1);
     assert_eq!(result.blocks[0].text, "Anchored heading");
@@ -45,7 +49,11 @@ fn standalone_headings_are_indexed_or_reported_unanchored() {
 
 #[test]
 fn standalone_visible_text_is_reported_unanchored() {
-    let result = extract_document_blocks("<ul><li>List item</li></ul><section>Other text</section>", 7).unwrap();
+    let result = extract_document_blocks(
+        "<ul><li>List item</li></ul><section>Other text</section>",
+        7,
+    )
+    .unwrap();
 
     assert!(result.unanchored > 0);
 }

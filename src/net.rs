@@ -183,12 +183,15 @@ impl Client {
                         if redirects >= 5 {
                             return Err(Error::Http(format!("too many redirects for {url}")));
                         }
-                        let location = resp.headers().get("location")
+                        let location = resp
+                            .headers()
+                            .get("location")
                             .and_then(|v| v.to_str().ok())
                             .ok_or_else(|| Error::Http(format!("invalid redirect for {url}")))?;
                         let base = ammonia::Url::parse(&current)
                             .map_err(|e| Error::Http(format!("invalid URL {current}: {e}")))?;
-                        let next = base.join(location)
+                        let next = base
+                            .join(location)
                             .map_err(|e| Error::Http(format!("invalid redirect for {url}: {e}")))?;
                         self.check_url(next.as_str())?;
                         current = next.into();
@@ -300,14 +303,17 @@ impl Client {
             let range = content_range(&resp).ok_or_else(|| {
                 DownloadError::Fatal(Error::Http(format!("invalid Content-Range for {url}")))
             })?;
-            if range.0 != have || range.1.checked_add(1) != Some(range.2)
+            if range.0 != have
+                || range.1.checked_add(1) != Some(range.2)
                 || total.is_some_and(|t| t != range.2)
                 || resp.headers().get("content-length").is_some_and(|v| {
                     v.to_str().ok().and_then(|s| s.parse::<u64>().ok())
                         != range.2.checked_sub(range.0)
                 })
             {
-                return Err(DownloadError::Fatal(Error::Http(format!("invalid Content-Range for {url}"))));
+                return Err(DownloadError::Fatal(Error::Http(format!(
+                    "invalid Content-Range for {url}"
+                ))));
             }
             Some(range)
         } else {

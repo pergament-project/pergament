@@ -534,7 +534,10 @@ fn note_anchor_resolves_john_3_16() {
     assert!(!quote.is_empty());
     assert!(!quote.starts_with("16"), "{quote}");
     // A footnote or cross-reference letter would trail the final punctuation.
-    assert!(quote.ends_with(['.', '!', '?', '"', '”', '“', '»', '«']), "{quote}");
+    assert!(
+        quote.ends_with(['.', '!', '?', '"', '”', '“', '»', '«']),
+        "{quote}"
+    );
     let reference = anchor.reference.unwrap();
     assert!(reference.ends_with("3:16"), "{reference}");
 }

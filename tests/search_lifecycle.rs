@@ -22,9 +22,14 @@ fn library_mutations_work_when_search_is_unavailable() {
     let root = dir.path().join("library");
     let mut library = Library::open(&root).unwrap();
     let connection = rusqlite::Connection::open(root.join("index.sqlite")).unwrap();
-    connection.execute_batch("DROP TABLE search_fts; UPDATE search_meta SET available = 0;").unwrap();
+    connection
+        .execute_batch("DROP TABLE search_fts; UPDATE search_meta SET available = 0;")
+        .unwrap();
     let entry = library.import(&package).unwrap();
-    assert_eq!(library.search_status().unwrap().state, CoverageState::Unavailable);
+    assert_eq!(
+        library.search_status().unwrap().state,
+        CoverageState::Unavailable
+    );
     assert!(library.remove(&entry).unwrap());
     assert!(library.list().unwrap().is_empty());
 }
@@ -72,9 +77,18 @@ fn replacing_a_publication_does_not_return_old_content() {
     library.import(&second).unwrap();
 
     assert!(library.search(&request("hello")).unwrap().hits.is_empty());
-    assert!(library.search(&request("replacement")).unwrap().hits.is_empty());
+    assert!(
+        library
+            .search(&request("replacement"))
+            .unwrap()
+            .hits
+            .is_empty()
+    );
     library.rebuild_search().unwrap();
-    assert_eq!(library.search(&request("replacement")).unwrap().hits.len(), 1);
+    assert_eq!(
+        library.search(&request("replacement")).unwrap().hits.len(),
+        1
+    );
 }
 
 #[test]
@@ -99,7 +113,10 @@ fn unanchored_content_keeps_coverage_incomplete() {
     let dir = tempdir().unwrap();
     let package = dir.path().join("fixture.jwpub");
     Fixture {
-        documents: vec![(1, r#"<p data-pid="1">Anchored</p><div>Missing anchor</div>"#.into())],
+        documents: vec![(
+            1,
+            r#"<p data-pid="1">Anchored</p><div>Missing anchor</div>"#.into(),
+        )],
         ..Fixture::default()
     }
     .write_to(&package);
@@ -134,7 +151,10 @@ fn failed_indexing_does_not_discard_other_publication_and_retry_recovers() {
     let failed_db = library.db_path(&failed_entry);
     let connection = rusqlite::Connection::open(failed_db).unwrap();
     connection
-        .execute("UPDATE Document SET Content = X'00' WHERE DocumentId = 1", [])
+        .execute(
+            "UPDATE Document SET Content = X'00' WHERE DocumentId = 1",
+            [],
+        )
         .unwrap();
     drop(connection);
 
@@ -142,8 +162,21 @@ fn failed_indexing_does_not_discard_other_publication_and_retry_recovers() {
     assert_eq!(status.failed, 1);
     assert_eq!(status.indexed, 1);
     assert_eq!(status.state, CoverageState::Incomplete);
-    assert_eq!(library.search(&request("good publication")).unwrap().hits.len(), 1);
-    assert!(library.search(&request("failed publication")).unwrap().hits.is_empty());
+    assert_eq!(
+        library
+            .search(&request("good publication"))
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
+    assert!(
+        library
+            .search(&request("failed publication"))
+            .unwrap()
+            .hits
+            .is_empty()
+    );
 
     let repaired_package = dir.path().join("repaired.jwpub");
     Fixture {
@@ -155,7 +188,14 @@ fn failed_indexing_does_not_discard_other_publication_and_retry_recovers() {
     let status = library.rebuild_search().unwrap();
     assert_eq!(status.failed, 0);
     assert_eq!(status.state, CoverageState::Ready);
-    assert_eq!(library.search(&request("repaired publication")).unwrap().hits.len(), 1);
+    assert_eq!(
+        library
+            .search(&request("repaired publication"))
+            .unwrap()
+            .hits
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -169,7 +209,10 @@ fn failed_coverage_survives_restart() {
     let database = library.db_path(&entry);
     let connection = rusqlite::Connection::open(database).unwrap();
     connection
-        .execute("UPDATE Document SET Content = X'00' WHERE DocumentId = 1", [])
+        .execute(
+            "UPDATE Document SET Content = X'00' WHERE DocumentId = 1",
+            [],
+        )
         .unwrap();
     drop(connection);
     let failed = library.rebuild_search().unwrap();

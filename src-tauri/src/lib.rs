@@ -460,7 +460,7 @@ async fn import_files(app: AppHandle, paths: Vec<String>) -> ApiResult<Vec<Impor
                         title: Some(e.title),
                         error: None,
                     }
-                },
+                }
                 Err(e) => ImportResult {
                     path,
                     title: None,
@@ -2291,10 +2291,19 @@ mod tests {
     #[test]
     fn search_scopes_use_stable_camel_case_payloads() {
         use pergament::search::SearchScope;
-        assert_eq!(serde_json::to_value(SearchScope::All).unwrap(), serde_json::json!({"kind": "all"}));
-        assert_eq!(serde_json::to_value(SearchScope::Bibles).unwrap(), serde_json::json!({"kind": "bibles"}));
         assert_eq!(
-            serde_json::to_value(SearchScope::Publication { dir_name: "w_0_1".into() }).unwrap(),
+            serde_json::to_value(SearchScope::All).unwrap(),
+            serde_json::json!({"kind": "all"})
+        );
+        assert_eq!(
+            serde_json::to_value(SearchScope::Bibles).unwrap(),
+            serde_json::json!({"kind": "bibles"})
+        );
+        assert_eq!(
+            serde_json::to_value(SearchScope::Publication {
+                dir_name: "w_0_1".into()
+            })
+            .unwrap(),
             serde_json::json!({"kind": "publication", "dirName": "w_0_1"})
         );
     }
@@ -2309,7 +2318,10 @@ mod tests {
             failed: 0,
             unanchored: 0,
         };
-        assert_eq!(serde_json::to_value(status).unwrap()["state"], "unavailable");
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["state"],
+            "unavailable"
+        );
     }
 
     #[test]

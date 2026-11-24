@@ -404,7 +404,10 @@ impl UserData {
             return Ok(current);
         }
         let mut bytes = [0u8; 4];
-        if fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_err() {
+        if fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut bytes))
+            .is_err()
+        {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())

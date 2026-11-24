@@ -89,10 +89,24 @@ fn searches_bible_verses_with_exact_targets_and_bible_scope() {
     let mut library = Library::open(dir.path().join("library")).unwrap();
     let entry = library.import(&package).unwrap();
     library.rebuild_search().unwrap();
-    let result = library.search(&SearchRequest { query: "beginning".into(), scope: SearchScope::Bibles, limit: None, offset: None }).unwrap();
+    let result = library
+        .search(&SearchRequest {
+            query: "beginning".into(),
+            scope: SearchScope::Bibles,
+            limit: None,
+            offset: None,
+        })
+        .unwrap();
     assert_eq!(result.hits.len(), 1);
     assert_eq!(result.hits[0].target.publication, entry.dir_name);
-    assert_eq!(result.hits[0].target.kind, TargetKind::Chapter { book: 1, chapter: 1, verse: 1 });
+    assert_eq!(
+        result.hits[0].target.kind,
+        TargetKind::Chapter {
+            book: 1,
+            chapter: 1,
+            verse: 1
+        }
+    );
 }
 
 #[test]
