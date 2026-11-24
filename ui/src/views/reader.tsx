@@ -355,11 +355,16 @@ export function ReaderView({
       else if (!(noteGuid && user.notes.some((n) => n.guid === noteGuid && n.blockIdentifier != null))) el?.scrollTo({ top: 0 });
       resumed.current = true;
     }
-    if (note && chapter && study) selectVerse(`${chapter.chapter}:${chapter.verse}`);
-    // Runs once per loaded page and study data, not on every selection.
+    // Runs once per loaded page, not on every selection.
     // User data arrives after this and must not re-run the jump: note positioning
     // is the note-jump effect's job, and it tracks user separately.
   }, [split, page, target, note, noteGuid, fromSearch, bookmark]);
+
+  // A study note asked for: select its verse in the pane once the page and its study data are both there,
+  // in whichever order they arrive.
+  useEffect(() => {
+    if (note && chapter && split && study) selectVerse(`${chapter.chapter}:${chapter.verse}`);
+  }, [split, study, note, target]);
 
   /** Show a reference in the pane: replace the pane stack, push onto it, or replace its top. */
   const showRef = useCallback((ref: PaneRef, mode: RefMode) => {
