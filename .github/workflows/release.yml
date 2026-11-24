@@ -64,8 +64,11 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: bun run tauri signer sign target/package/*.zip
 
-      - name: Write the text in front of the release notes
-        run: scripts/release-notes.sh > notes.md
+      - name: Prepare release notes
+        run: |
+          cat docs/release-notes-latest.md > notes.md
+          echo >> notes.md
+          echo '<!-- changes -->' >> notes.md
 
       - name: Publish the release
         env:
