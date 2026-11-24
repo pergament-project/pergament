@@ -20,6 +20,7 @@ use pergament::links::{Link, MediaRef};
 use pergament::mediator;
 use pergament::navigate::{Page, Target};
 use pergament::net::{Client, Expected, HttpConfig};
+use pergament::playlist::PlaylistSummary;
 use pergament::reading_plans::PlanSchedule;
 use pergament::remote::{self, Request};
 use pergament::sync_snapshot::DeleteGuard;
@@ -923,6 +924,218 @@ fn delete_reading_plan(state: State<'_, AppState>, guid: String) -> ApiResult<()
         .delete_reading_plan(&guid)
         .map_err(|e| e.to_string());
     edited(&state, deleted)
+}
+
+#[tauri::command]
+fn playlists(state: State<'_, AppState>) -> ApiResult<Vec<PlaylistSummary>> {
+    state.user()?.playlists().map_err(|e| e.to_string())
+}
+
+/// A playlist with the language code of each library item; the codes stay
+/// empty while no catalog is cached.
+#[tauri::command]
+fn playlist(app: AppHandle, id: i64) -> ApiResult<api::PlaylistView> {
+    let state = app.state::<AppState>();
+    let list = state.user()?.playlist(id).map_err(|e| e.to_string())?;
+    let _gate = state.cache_use()?;
+    let catalog = cached_catalog(&app)?;
+    let catalog = match &catalog {
+        Some(c) => Some(c.lock().map_err(|e| e.to_string())?),
+        None => None,
+    };
+    Ok(api::playlist_view(list, catalog.as_deref()))
+}
+
+#[tauri::command]
+fn create_playlist(state: State<'_, AppState>, name: String) -> ApiResult<i64> {
+    let created = state
+        .user()?
+        .create_playlist(&name)
+        .map_err(|e| e.to_string());
+    edited(&state, created)
+}
+
+#[tauri::command]
+fn rename_playlist(state: State<'_, AppState>, id: i64, name: String) -> ApiResult<()> {
+    let renamed = state
+        .user()?
+        .rename_playlist(id, &name)
+        .map_err(|e| e.to_string());
+    edited(&state, renamed)
+}
+
+#[tauri::command]
+fn delete_playlist(state: State<'_, AppState>, id: i64) -> ApiResult<()> {
+    let deleted = state.user()?.delete_playlist(id).map_err(|e| e.to_string());
+    edited(&state, deleted)
+}
+
+#[tauri::command]
+fn remove_playlist_item(state: State<'_, AppState>, item: i64) -> ApiResult<()> {
+    let removed = state
+        .user()?
+        .remove_playlist_item(item)
+        .map_err(|e| e.to_string());
+    edited(&state, removed)
+}
+
+#[tauri::command]
+fn move_playlist_item(
+    state: State<'_, AppState>,
+    playlist: i64,
+    item: i64,
+    position: i64,
+) -> ApiResult<()> {
+    let moved = state
+        .user()?
+        .move_playlist_item(playlist, item, position)
+        .map_err(|e| e.to_string());
+    edited(&state, moved)
+}
+
+/// Add a linked recording; its language must be in the cached catalog.
+#[tauri::command]
+fn add_library_playlist_item(
+    app: AppHandle,
+    playlist: i64,
+    media: MediaRef,
+    label: String,
+    duration: Option<f64>,
+) -> ApiResult<i64> {
+    let state = app.state::<AppState>();
+    let ticks = api::ticks(duration)?;
+    let library_ref = {
+        let _gate = state.cache_use()?;
+        let catalog = cached_catalog(&app)?.ok_or_else(|| "no catalog".to_string())?;
+        let catalog = catalog.lock().map_err(|e| e.to_string())?;
+        api::library_ref(&catalog, &media)?
+    };
+    let added = state
+        .user()?
+        .add_library_item(playlist, &library_ref, &label, ticks)
+        .map_err(|e| e.to_string());
+    edited(&state, added)
+}
+
+/// Result of [`add_file_playlist_items`].
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddedFiles {
+    added: Vec<i64>,
+    /// File names of unsupported or failed files.
+    skipped: Vec<String>,
+}
+
+/// Copy local files into a playlist; the ones that fail are reported by name.
+#[tauri::command]
+async fn add_file_playlist_items(
+    app: AppHandle,
+    playlist: i64,
+    paths: Vec<String>,
+) -> ApiResult<AddedFiles> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _job = state.job();
+        // Fail once for a missing playlist instead of skipping every file.
+        let media_dir = {
+            let user = state.user()?;
+            user.playlist(playlist).map_err(|e| e.to_string())?;
+            user.playlist_media_dir()
+        };
+        let mut result = AddedFiles {
+            added: Vec::new(),
+            skipped: Vec::new(),
+        };
+        for path in &paths {
+            let path = Path::new(path);
+            // Copied and hashed without the lock, so a large file does not
+            // block other commands; locked only for the transaction.
+            let added = userdata::stage_file_item(&media_dir, path)
+                .map_err(|e| e.to_string())
+                .and_then(|staged| {
+                    state
+                        .user()?
+                        .add_staged_file(playlist, staged)
+                        .map_err(|e| e.to_string())
+                });
+            match added {
+                Ok(id) => result.added.push(id),
+                Err(e) => {
+                    let name = path.file_name().map_or_else(
+                        || path.display().to_string(),
+                        |n| n.to_string_lossy().into_owned(),
+                    );
+                    eprintln!("cannot add {name} to playlist {playlist}: {e}");
+                    result.skipped.push(name);
+                }
+            }
+        }
+        if result.added.is_empty() {
+            Ok(result)
+        } else {
+            edited(&state, Ok(result))
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn set_playlist_item_duration(
+    state: State<'_, AppState>,
+    item: i64,
+    seconds: f64,
+) -> ApiResult<()> {
+    let ticks = api::ticks(Some(seconds))?;
+    let set = state
+        .user()?
+        .set_playlist_item_duration(item, ticks)
+        .map_err(|e| e.to_string());
+    edited(&state, set)
+}
+
+#[tauri::command]
+fn set_playlist_item_thumbnail(
+    state: State<'_, AppState>,
+    item: i64,
+    jpeg: Vec<u8>,
+) -> ApiResult<()> {
+    let set = state
+        .user()?
+        .set_playlist_item_thumbnail(item, &jpeg)
+        .map_err(|e| e.to_string());
+    edited(&state, set)
+}
+
+/// Import a `.jwlplaylist` file; returns the new playlist's id.
+#[tauri::command]
+async fn import_playlist(app: AppHandle, path: String) -> ApiResult<i64> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _job = state.job();
+        let imported = state
+            .user()?
+            .import_playlist(Path::new(&path))
+            .map_err(|e| e.to_string());
+        edited(&state, imported)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Write a playlist as a `.jwlplaylist` file.
+#[tauri::command]
+async fn export_playlist(app: AppHandle, id: i64, path: String) -> ApiResult<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _job = state.job();
+        state
+            .user()?
+            .export_playlist(id, Path::new(&path))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1885,6 +2098,11 @@ pub fn run() {
             // supports range requests; only the media folder is reachable.
             app.asset_protocol_scope()
                 .allow_directory(&media_dir, true)?;
+            // Files of playlists are shown and played from their own folder.
+            let playlist_media = app.state::<AppState>().user()?.playlist_media_dir();
+            std::fs::create_dir_all(&playlist_media)?;
+            app.asset_protocol_scope()
+                .allow_directory(&playlist_media, false)?;
             // Once an hour, write the daily rolling backup when it is due.
             let handle = app.handle().clone();
             std::thread::spawn(move || {
@@ -1915,10 +2133,25 @@ pub fn run() {
         .register_asynchronous_uri_scheme_protocol(api::MEDIA_SCHEME, |ctx, request, responder| {
             let app = ctx.app_handle().clone();
             let path = request.uri().path().to_owned();
-            if needs_fetch(&app, &path) {
-                std::thread::spawn(move || responder.respond(media_response(&app, &path)));
+            // Like the asset protocol, allow the page's origin, so the images
+            // can be drawn on a canvas without tainting it.
+            let origin = app
+                .get_webview_window(ctx.webview_label())
+                .and_then(|w| w.url().ok())
+                .map_or_else(|| "null".to_owned(), |url| api::url_origin(&url));
+            let respond = move || {
+                let mut response = media_response(&app, &path);
+                if let Ok(value) = origin.parse() {
+                    response
+                        .headers_mut()
+                        .insert("Access-Control-Allow-Origin", value);
+                }
+                responder.respond(response);
+            };
+            if needs_fetch(ctx.app_handle(), request.uri().path()) {
+                std::thread::spawn(respond);
             } else {
-                responder.respond(media_response(&app, &path));
+                respond();
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -1982,6 +2215,19 @@ pub fn run() {
             start_reading_plan,
             set_reading_day,
             delete_reading_plan,
+            playlists,
+            playlist,
+            create_playlist,
+            rename_playlist,
+            delete_playlist,
+            remove_playlist_item,
+            move_playlist_item,
+            add_library_playlist_item,
+            add_file_playlist_items,
+            set_playlist_item_duration,
+            set_playlist_item_thumbnail,
+            import_playlist,
+            export_playlist,
             all_notes,
             tags,
             bookmarks,

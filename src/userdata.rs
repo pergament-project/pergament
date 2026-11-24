@@ -13,6 +13,10 @@ use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 use zip::write::SimpleFileOptions;
 
+use crate::playlist::{
+    ItemKind, ItemSource, LibraryRef, MEDIA_DIR, PHOTO_TICKS, Playlist, PlaylistItemInfo,
+    PlaylistSummary, copy_hashed, file_type, ios_hash, kind_of_mime, safe_media_name,
+};
 use crate::sync_snapshot::{
     DeleteGuard, Plan, Resolver, RowKey, RowRef, Side, Snapshot, SyncMerge, SyncOutcome, classify,
     rows_of, rows_of_file,
@@ -27,7 +31,7 @@ pub const SCHEMA_VERSION: i64 = 16;
 pub const DEVICE_NAME: &str = "Pergament";
 
 /// Tables whose rows make up the content fingerprint.
-const FINGERPRINT_TABLES: [&str; 10] = [
+const FINGERPRINT_TABLES: [&str; 17] = [
     "Location",
     "UserMark",
     "BlockRange",
@@ -38,6 +42,13 @@ const FINGERPRINT_TABLES: [&str; 10] = [
     "InputField",
     "ReadingPlan",
     "ReadingPlanDay",
+    "PlaylistItem",
+    "PlaylistItemIndependentMediaMap",
+    "PlaylistItemLocationMap",
+    "PlaylistItemMarker",
+    "PlaylistItemMarkerBibleVerseMap",
+    "PlaylistItemMarkerParagraphMap",
+    "IndependentMedia",
 ];
 /// Pergament's own tables, missing in JW Library backups (docs/FORMAT.md).
 const READING_PLAN_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ReadingPlan(
@@ -75,6 +86,8 @@ pub const BLOCK_PARAGRAPH: i64 = 1;
 pub const BLOCK_VERSE: i64 = 2;
 /// `Tag.Type` of user tags (0 is the built-in favorites list).
 pub(crate) const TAG_USER: i64 = 1;
+/// `Tag.Type` of playlists.
+pub(crate) const TAG_PLAYLIST: i64 = 2;
 
 /// Database identity of a whole publication, independent of its download.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,6 +239,7 @@ pub struct Summary {
     pub notes: i64,
     pub tags: i64,
     pub bookmarks: i64,
+    pub playlists: i64,
     /// Device the backup was made on.
     pub device: Option<String>,
 }
@@ -362,6 +376,7 @@ impl UserData {
                     Value TEXT NOT NULL,
                     PRIMARY KEY(LocationId, TextTag));",
             )?;
+            conn.execute_batch(PLAYLIST_SCHEMA)?;
             conn.execute_batch(READING_PLAN_SCHEMA)?;
         }
         Ok(Self { conn, path })
@@ -407,6 +422,9 @@ impl UserData {
             notes: count("SELECT count(*) FROM Note")?,
             tags: count(&format!("SELECT count(*) FROM Tag WHERE Type = {TAG_USER}"))?,
             bookmarks: count("SELECT count(*) FROM Bookmark")?,
+            playlists: count(&format!(
+                "SELECT count(*) FROM Tag WHERE Type = {TAG_PLAYLIST}"
+            ))?,
             device: None,
         })
     }
@@ -1197,8 +1215,403 @@ impl UserData {
         Ok(tx.commit()?)
     }
 
+    /// Directory of playlist media files, beside the database.
+    pub fn playlist_media_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(MEDIA_DIR)
+    }
+
+    /// Every playlist by name, with its item count, total duration and the
+    /// first item's thumbnail.
+    pub fn playlists(&self) -> Result<Vec<PlaylistSummary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT TagId, Name FROM Tag WHERE Type = ?1 ORDER BY Name COLLATE NOCASE, TagId",
+        )?;
+        let tags = stmt
+            .query_map([TAG_PLAYLIST], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        tags.into_iter()
+            .map(|(id, name)| {
+                let items = self.playlist_items(id)?;
+                Ok(PlaylistSummary {
+                    id,
+                    name,
+                    items: items.len() as i64,
+                    duration_ticks: items.iter().map(|i| i.duration_ticks).sum(),
+                    thumbnail: items.first().and_then(|i| i.thumbnail.clone()),
+                })
+            })
+            .collect()
+    }
+
+    /// One playlist with its items in order.
+    pub fn playlist(&self, id: i64) -> Result<Playlist> {
+        let name = playlist_name_of(&self.conn, id)?;
+        Ok(Playlist {
+            id,
+            name,
+            items: self.playlist_items(id)?,
+        })
+    }
+
+    /// Items of playlist `tag` by `Position`. Items that cannot be shown
+    /// (unknown kind, unsafe file name, no media) are skipped.
+    fn playlist_items(&self, tag: i64) -> Result<Vec<PlaylistItemInfo>> {
+        let dir = self.playlist_media_dir();
+        let mut stmt = self.conn.prepare(
+            "SELECT i.PlaylistItemId, i.Label, i.StartTrimOffsetTicks, i.EndTrimOffsetTicks,
+                    i.EndAction, i.ThumbnailFilePath,
+                    l.KeySymbol, l.Track, l.IssueTagNumber, l.MepsLanguage, l.Type,
+                    lm.BaseDurationTicks, m.FilePath, m.MimeType, im.DurationTicks
+             FROM TagMap t JOIN PlaylistItem i ON i.PlaylistItemId = t.PlaylistItemId
+             LEFT JOIN PlaylistItemLocationMap lm ON lm.PlaylistItemId = i.PlaylistItemId
+             LEFT JOIN Location l ON l.LocationId = lm.LocationId
+             LEFT JOIN PlaylistItemIndependentMediaMap im ON im.PlaylistItemId = i.PlaylistItemId
+             LEFT JOIN IndependentMedia m ON m.IndependentMediaId = im.IndependentMediaId
+             WHERE t.TagId = ?1
+             ORDER BY t.Position, i.PlaylistItemId",
+        )?;
+        let mut rows = stmt.query([tag])?;
+        let mut items: Vec<PlaylistItemInfo> = Vec::new();
+        let mut last = None;
+        while let Some(r) = rows.next()? {
+            let id: i64 = r.get(0)?;
+            // An item with several media rows is read once.
+            if last == Some(id) {
+                continue;
+            }
+            last = Some(id);
+            let key_symbol: Option<String> = r.get(6)?;
+            let file: Option<String> = r.get(12)?;
+            let (kind, duration, source) = if let Some(key_symbol) = key_symbol {
+                let kind = match r.get::<_, i64>(10)? {
+                    2 => ItemKind::Audio,
+                    3 => ItemKind::Video,
+                    other => {
+                        eprintln!("playlist item {id}: location type {other} is not media");
+                        continue;
+                    }
+                };
+                let source = ItemSource::Library {
+                    key_symbol,
+                    track: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+                    issue_tag: r.get(8)?,
+                    meps_language: r.get::<_, Option<i64>>(9)?.unwrap_or(0),
+                    kind,
+                };
+                (kind, r.get::<_, Option<i64>>(11)?.unwrap_or(0), source)
+            } else if let Some(file) = file {
+                if !safe_media_name(&file) {
+                    eprintln!("playlist item {id}: unsafe media file name {file:?}");
+                    continue;
+                }
+                let mime: String = r.get(13)?;
+                let Some(kind) = kind_of_mime(&mime) else {
+                    eprintln!("playlist item {id}: unknown media type {mime:?}");
+                    continue;
+                };
+                let path = dir.join(&file);
+                let available = path.is_file();
+                let source = ItemSource::File {
+                    path,
+                    mime,
+                    available,
+                };
+                (kind, r.get::<_, Option<i64>>(14)?.unwrap_or(0), source)
+            } else {
+                eprintln!("playlist item {id}: no media");
+                continue;
+            };
+            let thumbnail = r
+                .get::<_, Option<String>>(5)?
+                .filter(|name| safe_media_name(name))
+                .map(|name| dir.join(name))
+                .filter(|path| path.is_file());
+            items.push(PlaylistItemInfo {
+                id,
+                label: r.get(1)?,
+                kind,
+                duration_ticks: duration,
+                start_trim_ticks: r.get(2)?,
+                end_trim_ticks: r.get(3)?,
+                end_action: r.get(4)?,
+                thumbnail,
+                source,
+            });
+        }
+        Ok(items)
+    }
+
+    /// A new, empty playlist; returns its id.
+    pub fn create_playlist(&mut self, name: &str) -> Result<i64> {
+        let tx = self.conn.transaction()?;
+        let name = new_playlist_name(&tx, name, None)?;
+        tx.execute(
+            "INSERT INTO Tag (Type, Name) VALUES (?1, ?2)",
+            params![TAG_PLAYLIST, name],
+        )?;
+        let id = tx.last_insert_rowid();
+        touch(&tx)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn rename_playlist(&mut self, id: i64, name: &str) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        playlist_name_of(&tx, id)?;
+        let name = new_playlist_name(&tx, name, Some(id))?;
+        tx.execute(
+            "UPDATE Tag SET Name = ?1 WHERE TagId = ?2",
+            params![name, id],
+        )?;
+        touch(&tx)?;
+        Ok(tx.commit()?)
+    }
+
+    /// Remove a playlist with its items; media no longer used is deleted.
+    pub fn delete_playlist(&mut self, id: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        playlist_name_of(&tx, id)?;
+        delete_playlist_rows(&tx, id)?;
+        let removed = remove_orphan_media(&tx)?;
+        touch(&tx)?;
+        tx.commit()?;
+        remove_media_files(&self.playlist_media_dir(), &removed);
+        Ok(())
+    }
+
+    /// Remove one item; the rest of its playlist moves up. Media no longer
+    /// used is deleted.
+    pub fn remove_playlist_item(&mut self, item: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        item_exists(&tx, item)?;
+        let tags = {
+            let mut stmt = tx.prepare("SELECT TagId FROM TagMap WHERE PlaylistItemId = ?1")?;
+            stmt.query_map([item], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        delete_item_rows(&tx, item)?;
+        for tag in tags {
+            let order = tag_map_order(&tx, tag)?;
+            renumber(&tx, tag, &order)?;
+        }
+        let removed = remove_orphan_media(&tx)?;
+        touch(&tx)?;
+        tx.commit()?;
+        remove_media_files(&self.playlist_media_dir(), &removed);
+        Ok(())
+    }
+
+    /// Append a recording of a publication to `playlist`: Location Type 2 and
+    /// MajorMultimediaType 0 for audio, Type 3 and 2 for video. Returns the
+    /// item id.
+    pub fn add_library_item(
+        &mut self,
+        playlist: i64,
+        item: &LibraryRef,
+        label: &str,
+        duration_ticks: i64,
+    ) -> Result<i64> {
+        let (location_type, multimedia_type) = match item.kind {
+            ItemKind::Audio => (2, 0),
+            ItemKind::Video => (3, 2),
+            ItemKind::Image => {
+                return Err(Error::Invalid("a library item is audio or video".into()));
+            }
+        };
+        let label = item_label(label)?;
+        if duration_ticks < 0 {
+            return Err(Error::Invalid(format!(
+                "duration {duration_ticks} is negative"
+            )));
+        }
+        let tx = self.conn.transaction()?;
+        playlist_name_of(&tx, playlist)?;
+        let found: Option<i64> = tx
+            .query_row(
+                "SELECT LocationId FROM Location
+                 WHERE BookNumber IS NULL AND ChapterNumber IS NULL AND DocumentId IS NULL
+                   AND KeySymbol = ?1 AND Track = ?2 AND IFNULL(IssueTagNumber, 0) = ?3
+                   AND MepsLanguage = ?4 AND Type = ?5
+                 ORDER BY LocationId LIMIT 1",
+                params![
+                    item.key_symbol,
+                    item.track,
+                    item.issue_tag,
+                    item.meps_language,
+                    location_type
+                ],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let location = match found {
+            Some(id) => id,
+            None => {
+                tx.execute(
+                    "INSERT INTO Location (KeySymbol, Track, IssueTagNumber, MepsLanguage, Type)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        item.key_symbol,
+                        item.track,
+                        item.issue_tag,
+                        item.meps_language,
+                        location_type
+                    ],
+                )?;
+                tx.last_insert_rowid()
+            }
+        };
+        let id = append_item(&tx, playlist, label)?;
+        tx.execute(
+            "INSERT INTO PlaylistItemLocationMap
+             (PlaylistItemId, LocationId, MajorMultimediaType, BaseDurationTicks)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, location, multimedia_type, duration_ticks],
+        )?;
+        touch(&tx)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Copy `src` into the media directory and append it to `playlist`,
+    /// labelled with its file name. Photos last `PHOTO_TICKS`; audio and
+    /// video start at 0 until [`Self::set_playlist_item_duration`]. Returns
+    /// the item id.
+    pub fn add_file_item(&mut self, playlist: i64, src: &Path) -> Result<i64> {
+        file_item_type(src)?;
+        playlist_name_of(&self.conn, playlist)?;
+        let staged = stage_file_item(&self.playlist_media_dir(), src)?;
+        self.add_staged_file(playlist, staged)
+    }
+
+    /// Append a file copied by [`stage_file_item`] to `playlist`, in one
+    /// transaction. Returns the item id; on any error the copy is removed.
+    pub fn add_staged_file(&mut self, playlist: i64, mut staged: StagedFile) -> Result<i64> {
+        let tx = self.conn.transaction()?;
+        playlist_name_of(&tx, playlist)?;
+        tx.execute(
+            "INSERT INTO IndependentMedia (OriginalFilename, FilePath, MimeType, Hash)
+             VALUES (?1, ?1, ?2, ?3)",
+            params![staged.name, staged.mime, staged.hash],
+        )?;
+        let media = tx.last_insert_rowid();
+        let id = append_item(&tx, playlist, &staged.label)?;
+        tx.execute(
+            "INSERT INTO PlaylistItemIndependentMediaMap
+             (PlaylistItemId, IndependentMediaId, DurationTicks) VALUES (?1, ?2, ?3)",
+            params![id, media, staged.ticks],
+        )?;
+        touch(&tx)?;
+        tx.commit()?;
+        staged.added = true;
+        Ok(id)
+    }
+
+    /// Set the length of a file item's audio or video, as measured by the UI.
+    /// A photo or a library item is `Error::Invalid`.
+    pub fn set_playlist_item_duration(&mut self, item: i64, ticks: i64) -> Result<()> {
+        if ticks < 0 {
+            return Err(Error::Invalid(format!("duration {ticks} is negative")));
+        }
+        let tx = self.conn.transaction()?;
+        item_exists(&tx, item)?;
+        let mime: Option<String> = tx
+            .query_row(
+                "SELECT m.MimeType FROM PlaylistItemIndependentMediaMap im
+                 JOIN IndependentMedia m ON m.IndependentMediaId = im.IndependentMediaId
+                 WHERE im.PlaylistItemId = ?1",
+                [item],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match mime.as_deref().and_then(kind_of_mime) {
+            Some(ItemKind::Audio | ItemKind::Video) => {}
+            _ => {
+                return Err(Error::Invalid(format!(
+                    "playlist item {item} is not an audio or video file"
+                )));
+            }
+        }
+        tx.execute(
+            "UPDATE PlaylistItemIndependentMediaMap SET DurationTicks = ?1
+             WHERE PlaylistItemId = ?2",
+            params![ticks, item],
+        )?;
+        touch(&tx)?;
+        Ok(tx.commit()?)
+    }
+
+    /// Store `jpeg` (at most 2 MiB) as the thumbnail of `item`. The old
+    /// thumbnail is deleted when nothing else uses it.
+    pub fn set_playlist_item_thumbnail(&mut self, item: i64, jpeg: &[u8]) -> Result<()> {
+        if jpeg.len() > MAX_THUMBNAIL {
+            return Err(Error::TooLarge(format!(
+                "thumbnail exceeds {MAX_THUMBNAIL} bytes"
+            )));
+        }
+        item_exists(&self.conn, item)?;
+        let dir = self.playlist_media_dir();
+        fs::create_dir_all(&dir)?;
+        let name = new_guid(&self.conn)?;
+        let digest = copy_hashed(&mut &jpeg[..], &dir.join(&name))?;
+
+        let mut write = || -> Result<Vec<String>> {
+            let tx = self.conn.transaction()?;
+            item_exists(&tx, item)?;
+            tx.execute(
+                "INSERT INTO IndependentMedia (OriginalFilename, FilePath, MimeType, Hash)
+                 VALUES (?1, ?1, 'image/jpeg', ?2)",
+                params![name, ios_hash(&digest)],
+            )?;
+            tx.execute(
+                "UPDATE PlaylistItem SET ThumbnailFilePath = ?1 WHERE PlaylistItemId = ?2",
+                params![name, item],
+            )?;
+            let removed = remove_orphan_media(&tx)?;
+            touch(&tx)?;
+            tx.commit()?;
+            Ok(removed)
+        };
+        match write() {
+            Ok(removed) => {
+                remove_media_files(&dir, &removed);
+                Ok(())
+            }
+            Err(e) => {
+                remove_media_files(&dir, std::slice::from_ref(&name));
+                Err(e)
+            }
+        }
+    }
+
+    /// Move `item` to 0-based `position` within `playlist`.
+    pub fn move_playlist_item(&mut self, playlist: i64, item: i64, position: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        playlist_name_of(&tx, playlist)?;
+        let mut order = tag_map_order(&tx, playlist)?;
+        let from = order
+            .iter()
+            .position(|(_, it)| *it == Some(item))
+            .ok_or_else(|| Error::NotFound(format!("playlist item {item}")))?;
+        if !(0..order.len() as i64).contains(&position) {
+            return Err(Error::Invalid(format!(
+                "position {position} is outside the playlist's {} items",
+                order.len()
+            )));
+        }
+        let entry = order.remove(from);
+        order.insert(position as usize, entry);
+        renumber(&tx, playlist, &order)?;
+        touch(&tx)?;
+        Ok(tx.commit()?)
+    }
+
     /// Hash of the user's content: every row of the data tables, but not the
-    /// database-wide `LastModified` clock, playlists or media. A merge keeps
+    /// database-wide `LastModified` clock. A merge keeps
     /// the later clock, so only the rows tell whether anything changed.
     pub fn fingerprint(&self) -> Result<String> {
         use rusqlite::types::ValueRef;
@@ -1254,8 +1667,21 @@ impl UserData {
         self.export_backup_as(dest, DEVICE_NAME)
     }
 
-    /// Like `export_backup`, with `device_name` in the manifest.
+    /// Like `export_backup`, with `device_name` in the manifest and the
+    /// playlist media files.
     pub fn export_backup_as(&self, dest: &Path, device_name: &str) -> Result<()> {
+        self.export_backup_with(dest, device_name, true)
+    }
+
+    /// Like `export_backup_as`. `media`: also write every referenced file
+    /// from playlist-media as a Stored zip entry named `FilePath`; files
+    /// missing here are left out.
+    pub fn export_backup_with(&self, dest: &Path, device_name: &str, media: bool) -> Result<()> {
+        let files = if media {
+            referenced_media(&self.conn)?
+        } else {
+            Vec::new()
+        };
         let dir = tempfile::tempdir()?;
         let copy = dir.path().join(DB_NAME);
         self.conn
@@ -1293,7 +1719,7 @@ impl UserData {
         };
 
         let partial = dest.with_extension("jwlibrary.part");
-        {
+        let write = || -> Result<()> {
             let mut zip = zip::ZipWriter::new(File::create(&partial)?);
             let options = SimpleFileOptions::default();
             zip.start_file(MANIFEST, options)?;
@@ -1302,16 +1728,47 @@ impl UserData {
             io::copy(&mut File::open(&copy)?, &mut zip)?;
             zip.start_file(THUMBNAIL, options)?;
             zip.write_all(THUMBNAIL_PNG)?;
+            write_media_entries(&mut zip, &self.playlist_media_dir(), &files, "backup")?;
             // On disk before it replaces an older file of the same name.
             zip.finish()?.sync_all()?;
-        }
-        fs::rename(&partial, dest)?;
-        Ok(())
+            fs::rename(&partial, dest)?;
+            Ok(())
+        };
+        write().inspect_err(|_| {
+            let _ = fs::remove_file(&partial);
+        })
     }
 
     /// Replace all data with the backup at `src`. The previous database is
-    /// kept next to it as `userData.db.before-restore`.
+    /// kept next to it as `userData.db.before-restore`. After the swap the
+    /// backup's playlist media are copied in, and the files only the
+    /// previous database used are removed; a file that cannot be copied
+    /// leaves its item unavailable.
     pub fn restore_backup(&mut self, src: &Path) -> Result<Summary> {
+        let old_media = referenced_media(&self.conn)?;
+        let summary = self.swap_in_backup(src)?;
+        match self.install_missing_media(src) {
+            Ok(missing) if !missing.is_empty() => {
+                eprintln!("restore: playlist media missing from the backup: {missing:?}");
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("could not copy the media of {}: {e}", src.display()),
+        }
+        match referenced_media(&self.conn) {
+            Ok(new_media) => {
+                let gone: Vec<String> = old_media
+                    .into_iter()
+                    .filter(|name| !new_media.contains(name))
+                    .collect();
+                remove_media_files(&self.playlist_media_dir(), &gone);
+            }
+            Err(e) => eprintln!("restore: could not read the restored playlist media: {e}"),
+        }
+        Ok(summary)
+    }
+
+    /// The database part of [`UserData::restore_backup`].
+    fn swap_in_backup(&mut self, src: &Path) -> Result<Summary> {
         let dir = self
             .path
             .parent()
@@ -1375,7 +1832,14 @@ impl UserData {
     pub fn merge_backup(&mut self, src: &Path) -> Result<MergeReport> {
         let (incoming, device) = self.unpack_incoming(src)?;
         self.write_safety_copy()?;
-        Ok(self.merge_file(incoming.path(), device, None)?.0)
+        let (report, _, orphans) = self.merge_file(incoming.path(), device, None)?;
+        // After the commit: a file that cannot be copied leaves its item
+        // unavailable, the merge stands.
+        if let Err(e) = self.install_missing_media(src) {
+            eprintln!("could not copy the media of {}: {e}", src.display());
+        }
+        remove_media_files(&self.playlist_media_dir(), &orphans);
+        Ok(report)
     }
 
     /// Merge another device's sync file at `src` three-way against `base`,
@@ -1422,7 +1886,9 @@ impl UserData {
             }
         };
         self.write_safety_copy()?;
-        let (report, deleted) = self.merge_file(incoming.path(), device, resolver.as_ref())?;
+        let (report, deleted, orphans) =
+            self.merge_file(incoming.path(), device, resolver.as_ref())?;
+        remove_media_files(&self.playlist_media_dir(), &orphans);
         Ok(SyncOutcome::Merged(SyncMerge {
             report,
             deleted,
@@ -1446,32 +1912,369 @@ impl UserData {
         Ok((incoming, manifest.user_data_backup.device_name))
     }
 
-    /// Merge the database file at `path`; returns the report and the number
-    /// of rows deleted (sync only).
+    /// Merge the database file at `path`; returns the report, the number
+    /// of rows deleted (sync only) and the media files no longer used, for
+    /// the caller to remove.
     fn merge_file(
         &mut self,
         path: &Path,
         device: String,
         sync: Option<&Resolver>,
-    ) -> Result<(MergeReport, i64)> {
-        // A merge that broke off earlier may have left `inc` attached.
-        let stale: bool = self.conn.query_row(
-            "SELECT count(*) > 0 FROM pragma_database_list WHERE name = 'inc'",
+    ) -> Result<(MergeReport, i64, Vec<String>)> {
+        self.with_attached(path, |ud| ud.merge_attached(device, sync))
+    }
+
+    /// Run `f` with the database file at `path` attached as `inc`.
+    fn with_attached<T>(
+        &mut self,
+        path: &Path,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        attach(&self.conn, path, "inc")?;
+        let result = f(self);
+        // Once the work is committed (or rolled back), a failing detach
+        // changes nothing about the data; the next attach detaches again.
+        let _ = self.conn.execute("DETACH DATABASE inc", []);
+        result
+    }
+
+    /// Import the `.jwlplaylist` file at `src` as a new playlist; returns its
+    /// id. The name gets ` (2)`, ` (3)`, … when it is taken. Locations are
+    /// matched like in a merge, media files by `FilePath`; files are copied
+    /// after the commit, and a file that cannot be copied leaves its item
+    /// unavailable. The manifest hash is not checked (JW Library's does not
+    /// match its database).
+    pub fn import_playlist(&mut self, src: &Path) -> Result<i64> {
+        let (incoming, _device) = self.unpack_incoming(src)?;
+        let id = self.with_attached(incoming.path(), |ud| {
+            let tx = ud.conn.transaction()?;
+            for table in PLAYLIST_TABLES {
+                if !has_table(&tx, "inc", table)? {
+                    return Err(Error::Invalid(format!(
+                        "not a playlist file: missing table {table}"
+                    )));
+                }
+            }
+            let tags: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare("SELECT TagId, Name FROM inc.Tag WHERE Type = ?1")?;
+                stmt.query_map([TAG_PLAYLIST], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            let [(inc_tag, name)] = &tags[..] else {
+                return Err(Error::Invalid("not a playlist file".into()));
+            };
+            let locations = merge_locations(&tx)?;
+            let name = free_playlist_name(&tx, name)?;
+            tx.execute(
+                "INSERT INTO main.Tag (Type, Name) VALUES (?1, ?2)",
+                params![TAG_PLAYLIST, name],
+            )?;
+            let id = tx.last_insert_rowid();
+            copy_playlist(&tx, &locations, *inc_tag, id)?;
+            touch(&tx)?;
+            tx.commit()?;
+            Ok(id)
+        })?;
+        if let Err(e) = self.install_missing_media(src) {
+            eprintln!("could not copy the media of {}: {e}", src.display());
+        }
+        Ok(id)
+    }
+
+    /// For every referenced `FilePath` missing from the media directory,
+    /// copy the entry of that name out of the zip at `zip_path`, when there
+    /// is one. Returns the names still missing, sorted. Unsafe names are
+    /// never looked up and are not returned.
+    pub(crate) fn install_missing_media(&self, zip_path: &Path) -> Result<Vec<String>> {
+        let dir = self.playlist_media_dir();
+        let missing: Vec<String> = referenced_media(&self.conn)?
+            .into_iter()
+            .filter(|name| !dir.join(name).is_file())
+            .collect();
+        if missing.is_empty() {
+            return Ok(missing);
+        }
+        let mut zip = ZipArchive::new(File::open(zip_path)?)?;
+        fs::create_dir_all(&dir)?;
+        let mut still = Vec::new();
+        for name in missing {
+            let copied = match zip.by_name(&name) {
+                Ok(mut entry) => copy_hashed(&mut entry, &dir.join(&name))
+                    .inspect_err(|e| eprintln!("could not copy playlist media {name:?}: {e}"))
+                    .is_ok(),
+                Err(_) => false,
+            };
+            if !copied {
+                still.push(name);
+            }
+        }
+        Ok(still)
+    }
+
+    /// Copy every referenced file present in playlist-media and missing in
+    /// `dir` into `dir` (.part + rename). Returns how many. `dir` is created
+    /// when there is something to copy, its parent is not; files already
+    /// there are left as they are. A file that cannot be copied is logged
+    /// and skipped.
+    pub fn publish_media(&self, dir: &Path) -> Result<usize> {
+        let src = self.playlist_media_dir();
+        let names: Vec<String> = referenced_media(&self.conn)?
+            .into_iter()
+            .filter(|name| src.join(name).is_file() && !dir.join(name).exists())
+            .collect();
+        if names.is_empty() {
+            return Ok(0);
+        }
+        // Only `dir` itself: a missing parent (a sync folder that is not
+        // mounted) is an error, not something to create.
+        match fs::create_dir(dir) {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e.into()),
+            _ => {}
+        }
+        Ok(names
+            .iter()
+            .filter(|name| copy_media_file(&src.join(name), &dir.join(name)))
+            .count())
+    }
+
+    /// Copy every referenced file missing in playlist-media from `dir`, when
+    /// it is there. Returns the names still missing, sorted. Nothing in
+    /// `dir` is changed.
+    pub fn fetch_media(&self, dir: &Path) -> Result<Vec<String>> {
+        let dest = self.playlist_media_dir();
+        let missing: Vec<String> = referenced_media(&self.conn)?
+            .into_iter()
+            .filter(|name| !dest.join(name).is_file())
+            .collect();
+        let mut still = Vec::new();
+        for name in missing {
+            let src = dir.join(&name);
+            let copied = src.is_file()
+                && fs::create_dir_all(&dest)
+                    .inspect_err(|e| eprintln!("could not create {}: {e}", dest.display()))
+                    .is_ok()
+                && copy_media_file(&src, &dest.join(&name));
+            if !copied {
+                still.push(name);
+            }
+        }
+        Ok(still)
+    }
+
+    /// Write playlist `id` as a `.jwlplaylist` file to `dest`: a database
+    /// with only that playlist, renumbered from 1, and the media files it
+    /// uses. Files missing here are left out.
+    pub fn export_playlist(&self, id: i64, dest: &Path) -> Result<()> {
+        let name = playlist_name_of(&self.conn, id)?;
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join(DB_NAME);
+        {
+            let out = Connection::open(&db)?;
+            out.execute_batch(SCHEMA)?;
+            out.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
+        attach(&self.conn, &db, "out")?;
+        let written = self.write_playlist_out(id, &name);
+        let _ = self.conn.execute("DETACH DATABASE out", []);
+        let (files, last_modified) = written?;
+
+        let hash = hex::encode(Sha256::digest(fs::read(&db)?));
+        let now: String = self.conn.query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%S+0000', 'now')",
             [],
             |r| r.get(0),
         )?;
-        if stale {
-            let _ = self.conn.execute("DETACH DATABASE inc", []);
-        }
-        self.conn.execute(
-            "ATTACH DATABASE ?1 AS inc",
-            [path.to_string_lossy().as_ref()],
+        let manifest = BackupManifest {
+            creation_date: now,
+            version: 1,
+            name: dest
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "playlist.jwlplaylist".into()),
+            kind: 1,
+            user_data_backup: BackupInfo {
+                last_modified_date: last_modified,
+                hash,
+                database_name: DB_NAME.into(),
+                device_name: DEVICE_NAME.into(),
+                schema_version: SCHEMA_VERSION,
+            },
+        };
+
+        let mut partial = dest.as_os_str().to_owned();
+        partial.push(".part");
+        let partial = PathBuf::from(partial);
+        let media = self.playlist_media_dir();
+        let write = || -> Result<()> {
+            let mut zip = zip::ZipWriter::new(File::create(&partial)?);
+            let options = SimpleFileOptions::default();
+            zip.start_file(MANIFEST, options)?;
+            zip.write_all(&serde_json::to_vec(&manifest)?)?;
+            zip.start_file(DB_NAME, options)?;
+            io::copy(&mut File::open(&db)?, &mut zip)?;
+            zip.start_file(THUMBNAIL, options)?;
+            zip.write_all(THUMBNAIL_PNG)?;
+            write_media_entries(&mut zip, &media, &files, "playlist export")?;
+            // On disk before it replaces an older file of the same name.
+            zip.finish()?.sync_all()?;
+            fs::rename(&partial, dest)?;
+            Ok(())
+        };
+        write().inspect_err(|_| {
+            let _ = fs::remove_file(&partial);
+        })
+    }
+
+    /// Copy playlist `id` into the empty database attached as `out`, as tag
+    /// 1 named `name`, every id renumbered from 1. Returns the `FilePath`s
+    /// it uses and the `LastModified` written.
+    fn write_playlist_out(&self, id: i64, name: &str) -> Result<(Vec<String>, String)> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO out.Tag (TagId, Type, Name) VALUES (1, ?1, ?2)",
+            params![TAG_PLAYLIST, name],
         )?;
-        let result = self.merge_attached(device, sync);
-        // Once the merge is committed (or rolled back), a failing detach
-        // changes nothing about the data; the next merge detaches again.
-        let _ = self.conn.execute("DETACH DATABASE inc", []);
-        result
+        let items: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT PlaylistItemId FROM main.TagMap
+                 WHERE TagId = ?1 AND PlaylistItemId IS NOT NULL ORDER BY Position, TagMapId",
+            )?;
+            stmt.query_map([id], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+
+        // Media first: the items' thumbnails point at it.
+        let mut media: Vec<(i64, String)> = Vec::new();
+        for &item in &items {
+            let mut stmt = tx.prepare(
+                "SELECT m.IndependentMediaId, m.FilePath FROM main.IndependentMedia m
+                 WHERE m.FilePath =
+                       (SELECT ThumbnailFilePath FROM main.PlaylistItem WHERE PlaylistItemId = ?1)
+                 UNION ALL
+                 SELECT m.IndependentMediaId, m.FilePath
+                 FROM main.PlaylistItemIndependentMediaMap im
+                 JOIN main.IndependentMedia m ON m.IndependentMediaId = im.IndependentMediaId
+                 WHERE im.PlaylistItemId = ?1",
+            )?;
+            let used = stmt
+                .query_map([item], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for row in used {
+                if !media.iter().any(|(m, _)| *m == row.0) {
+                    media.push(row);
+                }
+            }
+        }
+        let mut media_ids = HashMap::new();
+        for (n, (old, _)) in media.iter().enumerate() {
+            let new = n as i64 + 1;
+            tx.execute(
+                "INSERT INTO out.IndependentMedia
+                     (IndependentMediaId, OriginalFilename, FilePath, MimeType, Hash)
+                 SELECT ?1, OriginalFilename, FilePath, MimeType, Hash
+                 FROM main.IndependentMedia WHERE IndependentMediaId = ?2",
+                [new, *old],
+            )?;
+            media_ids.insert(*old, new);
+        }
+
+        let mut extra = String::new();
+        for column in ["Title", "Specialty", "Edition"] {
+            if has_column(&tx, "main", "Location", column)? {
+                extra.push_str(&format!(", {column}"));
+            }
+        }
+        let mut locations: HashMap<i64, i64> = HashMap::new();
+        let mut markers: i64 = 0;
+        for (n, &old) in items.iter().enumerate() {
+            let new = n as i64 + 1;
+            tx.execute(
+                "INSERT INTO out.PlaylistItem (PlaylistItemId, Label, StartTrimOffsetTicks,
+                     EndTrimOffsetTicks, Accuracy, EndAction, ThumbnailFilePath)
+                 SELECT ?1, Label, StartTrimOffsetTicks, EndTrimOffsetTicks, Accuracy,
+                     EndAction, ThumbnailFilePath
+                 FROM main.PlaylistItem WHERE PlaylistItemId = ?2",
+                [new, old],
+            )?;
+            tx.execute(
+                "INSERT INTO out.TagMap (TagMapId, PlaylistItemId, TagId, Position)
+                 VALUES (?1, ?1, 1, ?2)",
+                [new, n as i64],
+            )?;
+
+            let maps: Vec<(i64, i64, Option<i64>)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT LocationId, MajorMultimediaType, BaseDurationTicks
+                     FROM main.PlaylistItemLocationMap WHERE PlaylistItemId = ?1",
+                )?;
+                stmt.query_map([old], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for (location, kind, ticks) in maps {
+                let next = locations.len() as i64 + 1;
+                let local = *locations.entry(location).or_insert(next);
+                if local == next {
+                    tx.execute(
+                        &format!(
+                            "INSERT INTO out.Location (LocationId, BookNumber, ChapterNumber,
+                                 DocumentId, Track, IssueTagNumber, KeySymbol, MepsLanguage,
+                                 Type{extra})
+                             SELECT ?1, BookNumber, ChapterNumber, DocumentId, Track,
+                                 IssueTagNumber, KeySymbol, MepsLanguage, Type{extra}
+                             FROM main.Location WHERE LocationId = ?2"
+                        ),
+                        [local, location],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO out.PlaylistItemLocationMap
+                     (PlaylistItemId, LocationId, MajorMultimediaType, BaseDurationTicks)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![new, local, kind, ticks],
+                )?;
+            }
+
+            let maps: Vec<(i64, i64)> = {
+                let mut stmt = tx.prepare(
+                    "SELECT IndependentMediaId, DurationTicks
+                     FROM main.PlaylistItemIndependentMediaMap WHERE PlaylistItemId = ?1",
+                )?;
+                stmt.query_map([old], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for (file, ticks) in maps {
+                tx.execute(
+                    "INSERT INTO out.PlaylistItemIndependentMediaMap
+                     (PlaylistItemId, IndependentMediaId, DurationTicks) VALUES (?1, ?2, ?3)",
+                    params![new, media_ids[&file], ticks],
+                )?;
+            }
+
+            let olds: Vec<i64> = {
+                let mut stmt = tx.prepare(
+                    "SELECT PlaylistItemMarkerId FROM main.PlaylistItemMarker
+                     WHERE PlaylistItemId = ?1 ORDER BY StartTimeTicks, PlaylistItemMarkerId",
+                )?;
+                stmt.query_map([old], |r| r.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for marker in olds {
+                markers += 1;
+                copy_marker(&tx, "main", "out", marker, markers, new)?;
+            }
+        }
+        tx.execute(
+            "UPDATE out.LastModified SET LastModified = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')",
+            [],
+        )?;
+        let last_modified: String =
+            tx.query_row("SELECT LastModified FROM out.LastModified", [], |r| {
+                r.get(0)
+            })?;
+        tx.commit()?;
+        Ok((media.into_iter().map(|(_, f)| f).collect(), last_modified))
     }
 
     /// Copy the database to `userData.db.before-restore`, replacing an older copy.
@@ -1500,7 +2303,7 @@ impl UserData {
         &mut self,
         device: String,
         sync: Option<&Resolver>,
-    ) -> Result<(MergeReport, i64)> {
+    ) -> Result<(MergeReport, i64, Vec<String>)> {
         let tx = self.conn.transaction()?;
         let incoming_newer = incoming_is_newer(&tx)?;
         let mut report = MergeReport {
@@ -1511,9 +2314,9 @@ impl UserData {
         // the merge below never adds them back or updates them, and an
         // incoming highlight equal to a deleted one is added, not matched
         // to the row about to go.
-        let deleted = match sync {
+        let (deleted, playlists_deleted) = match sync {
             Some(sync) => delete_synced(&tx, sync, &mut report)?,
-            None => 0,
+            None => (0, false),
         };
         let locations = merge_locations(&tx)?;
         let marks = merge_marks(&tx, &locations, incoming_newer, sync, &mut report)?;
@@ -1526,11 +2329,20 @@ impl UserData {
         merge_location_tags(&tx, &locations, &tags, sync, &mut report)?;
         merge_bookmarks(&tx, &locations, incoming_newer, sync, &mut report)?;
         merge_reading_plans(&tx, sync, &mut report)?;
+        let replaced = merge_playlists(&tx, &locations, incoming_newer, sync, &mut report)?;
+        // One sweep once every playlist is merged: media a deleted playlist
+        // left may be used again by an incoming one. The files go after the
+        // commit.
+        let orphans = if playlists_deleted || replaced {
+            remove_orphan_media(&tx)?
+        } else {
+            Vec::new()
+        };
         if report.added + report.updated + deleted > 0 {
             take_later_clock(&tx)?;
         }
         tx.commit()?;
-        Ok((report, deleted))
+        Ok((report, deleted, orphans))
     }
 }
 
@@ -1564,7 +2376,283 @@ fn incoming_is_newer(tx: &Transaction<'_>) -> Result<Option<bool>> {
     })
 }
 
-fn has_table(tx: &Transaction<'_>, schema: &str, table: &str) -> Result<bool> {
+/// Attach the database file at `path` as `schema`. An attach that broke
+/// off earlier may have left `schema` attached; it is detached first.
+fn attach(conn: &Connection, path: &Path, schema: &str) -> Result<()> {
+    let stale: bool = conn.query_row(
+        "SELECT count(*) > 0 FROM pragma_database_list WHERE name = ?1",
+        [schema],
+        |r| r.get(0),
+    )?;
+    if stale {
+        let _ = conn.execute(&format!("DETACH DATABASE {schema}"), []);
+    }
+    conn.execute(
+        &format!("ATTACH DATABASE ?1 AS {schema}"),
+        [path.to_string_lossy().as_ref()],
+    )?;
+    Ok(())
+}
+
+/// Tables a database needs for [`copy_playlist`] and
+/// [`crate::playlist::content`] to read its playlists.
+pub(crate) const PLAYLIST_TABLES: [&str; 7] = [
+    "IndependentMedia",
+    "PlaylistItem",
+    "PlaylistItemIndependentMediaMap",
+    "PlaylistItemLocationMap",
+    "PlaylistItemMarker",
+    "PlaylistItemMarkerBibleVerseMap",
+    "PlaylistItemMarkerParagraphMap",
+];
+
+/// SQL for the tick column `column` of an incoming row: its value when it
+/// is a non-negative integer, else `fallback`.
+fn ticks_or(column: &str, fallback: &str) -> String {
+    format!(
+        "CASE WHEN typeof({column}) = 'integer' AND {column} >= 0 THEN {column} ELSE {fallback} END"
+    )
+}
+
+/// `name`, or `name (2)`, `name (3)`, … whichever no playlist has yet.
+fn free_playlist_name(conn: &Connection, name: &str) -> Result<String> {
+    let mut candidate = name.trim().to_owned();
+    for n in 2.. {
+        match new_playlist_name(conn, &candidate, None) {
+            Err(Error::Invalid(_)) if !candidate.is_empty() => {
+                candidate = format!("{} ({n})", name.trim());
+            }
+            other => return other,
+        }
+    }
+    unreachable!()
+}
+
+/// Copy marker `old` of `from` into `to` as `new`, on item `item`, with its
+/// verse and paragraph maps.
+fn copy_marker(
+    tx: &Transaction<'_>,
+    from: &str,
+    to: &str,
+    old: i64,
+    new: i64,
+    item: i64,
+) -> Result<()> {
+    tx.execute(
+        &format!(
+            "INSERT INTO {to}.PlaylistItemMarker (PlaylistItemMarkerId, PlaylistItemId, Label,
+                 StartTimeTicks, DurationTicks, EndTransitionDurationTicks)
+             SELECT ?1, ?2, Label, StartTimeTicks, DurationTicks, EndTransitionDurationTicks
+             FROM {from}.PlaylistItemMarker WHERE PlaylistItemMarkerId = ?3"
+        ),
+        [new, item, old],
+    )?;
+    tx.execute(
+        &format!(
+            "INSERT INTO {to}.PlaylistItemMarkerBibleVerseMap (PlaylistItemMarkerId, VerseId)
+             SELECT ?1, VerseId FROM {from}.PlaylistItemMarkerBibleVerseMap
+             WHERE PlaylistItemMarkerId = ?2"
+        ),
+        [new, old],
+    )?;
+    tx.execute(
+        &format!(
+            "INSERT INTO {to}.PlaylistItemMarkerParagraphMap (PlaylistItemMarkerId,
+                 MepsDocumentId, ParagraphIndex, MarkerIndexWithinParagraph)
+             SELECT ?1, MepsDocumentId, ParagraphIndex, MarkerIndexWithinParagraph
+             FROM {from}.PlaylistItemMarkerParagraphMap WHERE PlaylistItemMarkerId = ?2"
+        ),
+        [new, old],
+    )?;
+    Ok(())
+}
+
+/// The local `IndependentMedia` row with the `FilePath` `path` of an `inc`
+/// row, added when there is none. `None` when the name is unsafe or `inc`
+/// has no such row.
+fn local_media(tx: &Transaction<'_>, path: &str) -> Result<Option<(i64, String)>> {
+    if !safe_media_name(path) {
+        return Ok(None);
+    }
+    let found: Option<i64> = tx
+        .query_row(
+            "SELECT IndependentMediaId FROM main.IndependentMedia WHERE FilePath = ?1",
+            [path],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(found) = found {
+        return Ok(Some((found, path.to_owned())));
+    }
+    let added = tx.execute(
+        "INSERT INTO main.IndependentMedia (OriginalFilename, FilePath, MimeType, Hash)
+         SELECT OriginalFilename, FilePath, MimeType, Hash
+         FROM inc.IndependentMedia WHERE FilePath = ?1 ORDER BY IndependentMediaId LIMIT 1",
+        [path],
+    )?;
+    Ok((added > 0).then(|| (tx.last_insert_rowid(), path.to_owned())))
+}
+
+/// Append the items of `inc` playlist `inc_tag` to local playlist
+/// `local_tag`, in position order. Locations go through the
+/// `merge_locations` map. `IndependentMedia` is matched by `FilePath`
+/// (inserted when missing). An item whose media has an unsafe `FilePath`,
+/// or that has neither media nor a location in the map, is skipped; an
+/// unsafe thumbnail name leaves the item without one.
+/// Returns the `FilePath`s used. The caller checks that `inc` has the
+/// [`PLAYLIST_TABLES`].
+fn copy_playlist(
+    tx: &Transaction<'_>,
+    locations: &HashMap<i64, i64>,
+    inc_tag: i64,
+    local_tag: i64,
+) -> Result<Vec<String>> {
+    let items: Vec<(i64, Option<String>, bool)> = {
+        let mut stmt = tx.prepare(
+            "SELECT i.PlaylistItemId, i.ThumbnailFilePath,
+                    typeof(i.Label) = 'text' AND trim(i.Label) <> ''
+             FROM inc.TagMap t JOIN inc.PlaylistItem i ON i.PlaylistItemId = t.PlaylistItemId
+             WHERE t.TagId = ?1 ORDER BY t.Position, t.TagMapId",
+        )?;
+        stmt.query_map([inc_tag], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    let mut used: Vec<String> = Vec::new();
+    let mut use_name = |name: String| {
+        if !used.contains(&name) {
+            used.push(name);
+        }
+    };
+    for (old, thumbnail, labelled) in items {
+        if !labelled {
+            eprintln!("playlist import: item {old} skipped, empty label");
+            continue;
+        }
+        let location_maps: Vec<(i64, i64, Option<i64>)> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT LocationId, MajorMultimediaType, {}
+                 FROM inc.PlaylistItemLocationMap WHERE PlaylistItemId = ?1",
+                ticks_or("BaseDurationTicks", "NULL")
+            ))?;
+            stmt.query_map([old], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let media_maps: Vec<(String, i64)> = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT m.FilePath, {}
+                 FROM inc.PlaylistItemIndependentMediaMap im
+                 JOIN inc.IndependentMedia m ON m.IndependentMediaId = im.IndependentMediaId
+                 WHERE im.PlaylistItemId = ?1",
+                ticks_or("im.DurationTicks", "0")
+            ))?;
+            stmt.query_map([old], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        // Checked before anything is written, so a skipped item leaves no rows.
+        if let Some((name, _)) = media_maps.iter().find(|(name, _)| !safe_media_name(name)) {
+            eprintln!("playlist import: item {old} skipped, unsafe media file name {name:?}");
+            continue;
+        }
+        let located = location_maps
+            .iter()
+            .any(|(location, ..)| locations.contains_key(location));
+        if media_maps.is_empty() && !located {
+            eprintln!("playlist import: item {old} skipped, no media and no known location");
+            continue;
+        }
+        let mut media = Vec::with_capacity(media_maps.len());
+        for (name, ticks) in media_maps {
+            media.extend(local_media(tx, &name)?.map(|found| (found, ticks)));
+        }
+        let thumbnail = match thumbnail {
+            Some(name) => match local_media(tx, &name)? {
+                Some((_, name)) => Some(name),
+                None => {
+                    eprintln!("playlist import: item {old}: thumbnail {name:?} dropped");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        // Out-of-range values become the defaults: no trim, EndAction 0,
+        // Accuracy 2 (NeedsUserVerification).
+        tx.execute(
+            &format!(
+                "INSERT INTO main.PlaylistItem (Label, StartTrimOffsetTicks, EndTrimOffsetTicks,
+                     Accuracy, EndAction, ThumbnailFilePath)
+                 SELECT Label, {}, {},
+                     CASE WHEN typeof(Accuracy) = 'integer' AND Accuracy IN (1, 2)
+                          THEN Accuracy ELSE 2 END,
+                     CASE WHEN typeof(EndAction) = 'integer' AND EndAction BETWEEN 0 AND 3
+                          THEN EndAction ELSE 0 END,
+                     ?2
+                 FROM inc.PlaylistItem WHERE PlaylistItemId = ?1",
+                ticks_or("StartTrimOffsetTicks", "NULL"),
+                ticks_or("EndTrimOffsetTicks", "NULL"),
+            ),
+            params![old, thumbnail],
+        )?;
+        let new = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO main.TagMap (PlaylistItemId, TagId, Position)
+             VALUES (?1, ?2,
+                     (SELECT IFNULL(max(Position), -1) + 1 FROM main.TagMap WHERE TagId = ?2))",
+            params![new, local_tag],
+        )?;
+        for (location, kind, ticks) in location_maps {
+            let Some(local) = locations.get(&location) else {
+                continue;
+            };
+            tx.execute(
+                "INSERT OR IGNORE INTO main.PlaylistItemLocationMap
+                 (PlaylistItemId, LocationId, MajorMultimediaType, BaseDurationTicks)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![new, local, kind, ticks],
+            )?;
+        }
+        for ((id, name), ticks) in media {
+            tx.execute(
+                "INSERT OR IGNORE INTO main.PlaylistItemIndependentMediaMap
+                 (PlaylistItemId, IndependentMediaId, DurationTicks) VALUES (?1, ?2, ?3)",
+                params![new, id, ticks],
+            )?;
+            use_name(name);
+        }
+        if let Some(name) = thumbnail {
+            use_name(name);
+        }
+        let markers: Vec<(i64, bool)> = {
+            let mut stmt = tx.prepare(
+                "SELECT PlaylistItemMarkerId,
+                        typeof(Label) = 'text' AND trim(Label) <> ''
+                        AND typeof(StartTimeTicks) = 'integer' AND StartTimeTicks >= 0
+                        AND typeof(DurationTicks) = 'integer' AND DurationTicks >= 0
+                        AND typeof(EndTransitionDurationTicks) = 'integer'
+                        AND EndTransitionDurationTicks >= 0
+                 FROM inc.PlaylistItemMarker
+                 WHERE PlaylistItemId = ?1 ORDER BY StartTimeTicks, PlaylistItemMarkerId",
+            )?;
+            stmt.query_map([old], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        for (marker, valid) in markers {
+            if !valid {
+                eprintln!("playlist import: item {old}: marker {marker} skipped, invalid values");
+                continue;
+            }
+            let next: i64 = tx.query_row(
+                "SELECT IFNULL(max(PlaylistItemMarkerId), 0) + 1 FROM main.PlaylistItemMarker",
+                [],
+                |r| r.get(0),
+            )?;
+            copy_marker(tx, "inc", "main", marker, next, new)?;
+        }
+    }
+    Ok(used)
+}
+
+fn has_table(tx: &Connection, schema: &str, table: &str) -> Result<bool> {
     Ok(tx.query_row(
         &format!(
             "SELECT count(*) > 0 FROM {schema}.sqlite_master WHERE type = 'table' AND name = ?1"
@@ -1632,20 +2720,30 @@ fn plan_of(sync: Option<&Resolver>, row: RowRef, local: Option<RowRef>) -> Optio
 
 /// Delete the local rows the other device deleted, through the editor's
 /// deletion paths, and report the rows kept because they changed here.
-/// Returns how many rows were deleted.
-fn delete_synced(tx: &Transaction<'_>, sync: &Resolver, report: &mut MergeReport) -> Result<i64> {
+/// Returns how many rows were deleted and whether a playlist was. Media a
+/// deleted playlist leaves unused is not removed here: an incoming playlist
+/// merged afterwards may use it again.
+fn delete_synced(
+    tx: &Transaction<'_>,
+    sync: &Resolver,
+    report: &mut MergeReport,
+) -> Result<(i64, bool)> {
     // Tag maps and ticked days first, then notes and highlights; tags last,
     // once nothing refers to them.
     let order = |key: &RowKey| match key {
         RowKey::TagMap(..) | RowKey::ReadingPlanDay(..) => 0,
         RowKey::Note(_) => 1,
         RowKey::Mark(_) => 2,
-        RowKey::Bookmark(..) | RowKey::InputField(..) | RowKey::ReadingPlan(_) => 3,
+        RowKey::Bookmark(..)
+        | RowKey::InputField(..)
+        | RowKey::ReadingPlan(_)
+        | RowKey::Playlist(_) => 3,
         RowKey::Tag(..) => 4,
     };
     let mut keys: Vec<&RowKey> = sync.classified.delete.iter().collect();
     keys.sort_by_key(|k| order(k));
     let mut deleted = 0;
+    let mut playlists = false;
     for key in keys {
         // Only the row the snapshot was read from: a second row with the
         // same key was never seen there.
@@ -1704,6 +2802,11 @@ fn delete_synced(tx: &Transaction<'_>, sync: &Resolver, report: &mut MergeReport
                     [id],
                 )?;
             }
+            // With its items, as the editor deletes a playlist.
+            RowRef::Playlist(id) => {
+                delete_playlist_rows(tx, *id)?;
+                playlists = true;
+            }
         }
         deleted += 1;
     }
@@ -1712,7 +2815,7 @@ fn delete_synced(tx: &Transaction<'_>, sync: &Resolver, report: &mut MergeReport
             report.conflicts.push(describe_local(tx, row)?);
         }
     }
-    Ok(deleted)
+    Ok((deleted, playlists))
 }
 
 /// A local row as a conflict: one deleted in the backup and kept here.
@@ -1781,6 +2884,13 @@ fn describe_local(tx: &Transaction<'_>, row: &RowRef) -> Result<Conflict> {
             )?;
             let summary = format!("Reading plan {key}, day {day}");
             conflict("ReadingPlanDay", &format!("{guid}:{day}"), summary)
+        }
+        RowRef::Playlist(id) => {
+            let name: String =
+                tx.query_row("SELECT Name FROM main.Tag WHERE TagId = ?1", [id], |r| {
+                    r.get(0)
+                })?;
+            conflict("Playlist", &name, format!("Playlist {name}"))
         }
     })
 }
@@ -2239,15 +3349,17 @@ fn merge_input_fields(
 
 /// Map every incoming `Tag` to the local one with the same type and name,
 /// adding the missing ones (but not those the sync merge keeps deleted).
-/// Returns incoming `TagId` → local `TagId`.
+/// Playlists are left to [`merge_playlists`]. Returns incoming `TagId` →
+/// local `TagId`.
 fn merge_tags(
     tx: &Transaction<'_>,
     sync: Option<&Resolver>,
     report: &mut MergeReport,
 ) -> Result<HashMap<i64, i64>> {
     let incoming: Vec<(i64, i64, String)> = {
-        let mut stmt = tx.prepare("SELECT TagId, Type, Name FROM inc.Tag ORDER BY TagId")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let mut stmt = tx
+            .prepare("SELECT TagId, Type, Name FROM inc.Tag WHERE Type IS NOT ?1 ORDER BY TagId")?;
+        let rows = stmt.query_map([TAG_PLAYLIST], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     let mut map = HashMap::with_capacity(incoming.len());
@@ -2795,6 +3907,198 @@ fn merge_reading_plans(
     Ok(())
 }
 
+/// Merge the playlists of `inc`, matched by name. A missing playlist is
+/// added; of two different versions the newer one wins (sync: its plan),
+/// else the local one stays and the other is listed. A manual merge that
+/// takes the incoming version keeps the local file items whose media the
+/// incoming version lacks, after the incoming items. Returns whether a
+/// local playlist was replaced, so media may have been left unused.
+fn merge_playlists(
+    tx: &Transaction<'_>,
+    locations: &HashMap<i64, i64>,
+    incoming_newer: Option<bool>,
+    sync: Option<&Resolver>,
+    report: &mut MergeReport,
+) -> Result<bool> {
+    for table in PLAYLIST_TABLES {
+        if !has_table(tx, "inc", table)? {
+            return Ok(false);
+        }
+    }
+    let incoming: Vec<(i64, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT TagId, Name FROM inc.Tag WHERE Type = ?1 ORDER BY TagId")?;
+        let rows = stmt.query_map([TAG_PLAYLIST], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut replaced = false;
+    for (id, name) in incoming {
+        let local: Option<i64> = tx
+            .query_row(
+                "SELECT TagId FROM main.Tag WHERE Type = ?1 AND Name = ?2",
+                params![TAG_PLAYLIST, name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let plan = plan_of(sync, RowRef::Playlist(id), local.map(RowRef::Playlist));
+        let summary = || format!("Playlist {name}");
+        let Some(local) = local else {
+            if deleted_here(plan) {
+                report.unchanged += 1;
+                continue;
+            }
+            tx.execute(
+                "INSERT INTO main.Tag (Type, Name) VALUES (?1, ?2)",
+                params![TAG_PLAYLIST, name],
+            )?;
+            copy_playlist(tx, locations, id, tx.last_insert_rowid())?;
+            report.added += 1;
+            if reported(plan) {
+                report
+                    .conflicts
+                    .push(conflict("Playlist", &name, summary()));
+            }
+            continue;
+        };
+        if crate::playlist::content(tx, "main", local)? == crate::playlist::content(tx, "inc", id)?
+            || (sync.is_none() && is_kept_replace(tx, id, local)?)
+        {
+            report.unchanged += 1;
+            continue;
+        }
+        match decide(plan, incoming_newer) {
+            Outcome::Take => {
+                let kept = if sync.is_none() {
+                    keep_own_files(tx, id, local)?
+                } else {
+                    Vec::new()
+                };
+                for item in playlist_items(tx, local)? {
+                    delete_item_rows(tx, item)?;
+                }
+                copy_playlist(tx, locations, id, local)?;
+                for item in kept {
+                    tx.execute(
+                        "INSERT INTO main.TagMap (PlaylistItemId, TagId, Position)
+                         VALUES (?1, ?2, (SELECT IFNULL(max(Position), -1) + 1
+                                          FROM main.TagMap WHERE TagId = ?2))",
+                        [item, local],
+                    )?;
+                }
+                replaced = true;
+                report.updated += 1;
+                if reported(plan) {
+                    report
+                        .conflicts
+                        .push(conflict("Playlist", &name, summary()));
+                }
+            }
+            Outcome::Keep => report.unchanged += 1,
+            Outcome::Conflict => report
+                .conflicts
+                .push(conflict("Playlist", &name, summary())),
+        }
+    }
+    Ok(replaced)
+}
+
+/// The items of local playlist `tag`, in position order.
+fn playlist_items(tx: &Transaction<'_>, tag: i64) -> Result<Vec<i64>> {
+    let mut stmt = tx.prepare(
+        "SELECT PlaylistItemId FROM main.TagMap
+         WHERE TagId = ?1 AND PlaylistItemId IS NOT NULL ORDER BY Position, TagMapId",
+    )?;
+    let rows = stmt.query_map([tag], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Whether local playlist `local` is what a manual merge replace would have
+/// left: the items of incoming playlist `inc_tag`, then the local file items
+/// the keep rule appends (see `own_file_items`). Such a playlist counts as
+/// unchanged, so merging the same backup again reports nothing.
+fn is_kept_replace(tx: &Transaction<'_>, inc_tag: i64, local: i64) -> Result<bool> {
+    let own = own_file_items(tx, inc_tag, local)?.len();
+    if own == 0 {
+        return Ok(false);
+    }
+    let here = crate::playlist::content(tx, "main", local)?;
+    let there = crate::playlist::content(tx, "inc", inc_tag)?;
+    // The prefix matches the incoming items, whose media the own items lack,
+    // so the own items can only be the trailing ones.
+    Ok(here.len() == there.len() + own && here[..there.len()] == there[..])
+}
+
+/// The file items of local playlist `local` whose media no item of
+/// incoming playlist `inc_tag` uses, in position order.
+fn own_file_items(tx: &Transaction<'_>, inc_tag: i64, local: i64) -> Result<Vec<i64>> {
+    let mut stmt = tx.prepare(
+        "SELECT t.PlaylistItemId FROM main.TagMap t
+         WHERE t.TagId = ?1 AND t.PlaylistItemId IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM main.PlaylistItemLocationMap l
+                           WHERE l.PlaylistItemId = t.PlaylistItemId)
+           AND EXISTS (SELECT 1 FROM main.PlaylistItemIndependentMediaMap im
+                       WHERE im.PlaylistItemId = t.PlaylistItemId)
+           AND NOT EXISTS (
+               SELECT 1 FROM main.PlaylistItemIndependentMediaMap im
+               JOIN main.IndependentMedia m ON m.IndependentMediaId = im.IndependentMediaId
+               WHERE im.PlaylistItemId = t.PlaylistItemId
+                 AND m.FilePath IN (
+                     SELECT im2_m.FilePath FROM inc.TagMap t2
+                     JOIN inc.PlaylistItemIndependentMediaMap im2
+                          ON im2.PlaylistItemId = t2.PlaylistItemId
+                     JOIN inc.IndependentMedia im2_m
+                          ON im2_m.IndependentMediaId = im2.IndependentMediaId
+                     WHERE t2.TagId = ?2))
+         ORDER BY t.Position, t.TagMapId",
+    )?;
+    let rows = stmt.query_map([local, inc_tag], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Copy the items `own_file_items` picks as new items with the same values
+/// on the same `IndependentMedia` rows, but on no playlist yet. Returns the
+/// new items in the order of the old ones.
+fn keep_own_files(tx: &Transaction<'_>, inc_tag: i64, local: i64) -> Result<Vec<i64>> {
+    let own = own_file_items(tx, inc_tag, local)?;
+    let mut kept = Vec::with_capacity(own.len());
+    for old in own {
+        tx.execute(
+            "INSERT INTO main.PlaylistItem (Label, StartTrimOffsetTicks, EndTrimOffsetTicks,
+                 Accuracy, EndAction, ThumbnailFilePath)
+             SELECT Label, StartTrimOffsetTicks, EndTrimOffsetTicks, Accuracy, EndAction,
+                 ThumbnailFilePath
+             FROM main.PlaylistItem WHERE PlaylistItemId = ?1",
+            [old],
+        )?;
+        let new = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO main.PlaylistItemIndependentMediaMap
+                 (PlaylistItemId, IndependentMediaId, DurationTicks)
+             SELECT ?1, IndependentMediaId, DurationTicks
+             FROM main.PlaylistItemIndependentMediaMap WHERE PlaylistItemId = ?2",
+            [new, old],
+        )?;
+        let markers: Vec<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT PlaylistItemMarkerId FROM main.PlaylistItemMarker
+                 WHERE PlaylistItemId = ?1 ORDER BY StartTimeTicks, PlaylistItemMarkerId",
+            )?;
+            let rows = stmt.query_map([old], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for marker in markers {
+            let next: i64 = tx.query_row(
+                "SELECT IFNULL(max(PlaylistItemMarkerId), 0) + 1 FROM main.PlaylistItemMarker",
+                [],
+                |r| r.get(0),
+            )?;
+            copy_marker(tx, "main", "main", marker, next, new)?;
+        }
+        kept.push(new);
+    }
+    Ok(kept)
+}
+
 /// Add the ticked days of incoming plan `incoming` that are missing in
 /// local plan `local`, unless they were unticked here. Days outside a
 /// plan of the catalog are left out.
@@ -2908,6 +4212,78 @@ pub(crate) fn check_database(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A media file copied into the media directory but not yet in the
+/// database (see [`stage_file_item`]). Dropping it before
+/// [`UserData::add_staged_file`] commits removes the file.
+#[derive(Debug)]
+pub struct StagedFile {
+    dir: PathBuf,
+    /// `FilePath`: the GUID plus the lowercase extension.
+    name: String,
+    mime: &'static str,
+    /// `Hash` column value.
+    hash: String,
+    label: String,
+    ticks: i64,
+    added: bool,
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if !self.added {
+            remove_media_files(&self.dir, std::slice::from_ref(&self.name));
+        }
+    }
+}
+
+/// Kind, MIME type and lowercase extension of the media file `src`;
+/// `Invalid` when it is not one.
+fn file_item_type(src: &Path) -> Result<(ItemKind, &'static str, String)> {
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let (kind, mime) = file_type(&ext)
+        .ok_or_else(|| Error::Invalid(format!("{} is not a media file", src.display())))?;
+    Ok((kind, mime, ext))
+}
+
+/// The first half of [`UserData::add_file_item`], which needs no database:
+/// check `src`, copy it into the media directory `dir` (at most
+/// `MAX_MEDIA` bytes, through a `.part` file) under a new GUID name and hash
+/// it. Labelled with its file name; photos last `PHOTO_TICKS`, audio and
+/// video 0.
+pub fn stage_file_item(dir: &Path, src: &Path) -> Result<StagedFile> {
+    let (kind, mime, ext) = file_item_type(src)?;
+    let label = src
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let label = item_label(&label)?.to_owned();
+    let ticks = if kind == ItemKind::Image {
+        PHOTO_TICKS
+    } else {
+        0
+    };
+    // A private connection only as a random source, so the user data stays free.
+    let guid = new_guid(&Connection::open_in_memory()?)?;
+    let name = format!("{guid}.{ext}");
+    debug_assert!(safe_media_name(&name));
+    let mut file = File::open(src)?;
+    fs::create_dir_all(dir)?;
+    let digest = copy_hashed(&mut file, &dir.join(&name))?;
+    Ok(StagedFile {
+        dir: dir.to_owned(),
+        name,
+        mime,
+        hash: ios_hash(&digest),
+        label,
+        ticks,
+        added: false,
+    })
+}
+
 /// Random uppercase UUID (version 4), like the ones JW Library writes.
 fn new_guid(conn: &Connection) -> Result<String> {
     let mut bytes: Vec<u8> = conn.query_row("SELECT randomblob(16)", [], |r| r.get(0))?;
@@ -2930,6 +4306,250 @@ fn touch(tx: &Transaction<'_>) -> Result<()> {
         [],
     )?;
     Ok(())
+}
+
+/// Name of playlist `id`; `NotFound` for an unknown tag or one that is not a
+/// playlist.
+fn playlist_name_of(conn: &Connection, id: i64) -> Result<String> {
+    conn.query_row(
+        "SELECT Name FROM Tag WHERE TagId = ?1 AND Type = ?2",
+        params![id, TAG_PLAYLIST],
+        |r| r.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| Error::NotFound(format!("playlist {id}")))
+}
+
+/// `name` trimmed, if it is not empty and no other playlist than `except`
+/// has it.
+fn new_playlist_name(conn: &Connection, name: &str, except: Option<i64>) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(Error::Invalid("a playlist needs a name".into()));
+    }
+    let taken: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM Tag WHERE Type = ?1 AND Name = ?2 AND TagId IS NOT ?3)",
+        params![TAG_PLAYLIST, name, except],
+        |r| r.get(0),
+    )?;
+    if taken {
+        return Err(Error::Invalid(format!("playlist {name:?} already exists")));
+    }
+    Ok(name.to_owned())
+}
+
+/// Largest accepted thumbnail (2 MiB).
+const MAX_THUMBNAIL: usize = 2 << 20;
+
+/// `NotFound` unless playlist item `item` exists.
+fn item_exists(conn: &Connection, item: i64) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM PlaylistItem WHERE PlaylistItemId = ?1)",
+        [item],
+        |r| r.get(0),
+    )?;
+    if exists {
+        Ok(())
+    } else {
+        Err(Error::NotFound(format!("playlist item {item}")))
+    }
+}
+
+/// `label` trimmed; `Invalid` when empty (JW Library needs a label).
+fn item_label(label: &str) -> Result<&str> {
+    let label = label.trim();
+    if label.is_empty() {
+        return Err(Error::Invalid("a playlist item needs a label".into()));
+    }
+    Ok(label)
+}
+
+/// Insert a `PlaylistItem` (Accuracy 1, EndAction 0, no trims) at the end of
+/// `playlist`; returns its id.
+fn append_item(tx: &Transaction<'_>, playlist: i64, label: &str) -> Result<i64> {
+    tx.execute(
+        "INSERT INTO PlaylistItem (Label, Accuracy, EndAction) VALUES (?1, 1, 0)",
+        [label],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO TagMap (PlaylistItemId, TagId, Position)
+         VALUES (?1, ?2, (SELECT IFNULL(max(Position), -1) + 1 FROM TagMap WHERE TagId = ?2))",
+        params![id, playlist],
+    )?;
+    Ok(id)
+}
+
+/// `TagMap` rows of `tag` by `Position`: `(TagMapId, PlaylistItemId)`.
+fn tag_map_order(tx: &Transaction<'_>, tag: i64) -> Result<Vec<(i64, Option<i64>)>> {
+    let mut stmt = tx.prepare(
+        "SELECT TagMapId, PlaylistItemId FROM TagMap WHERE TagId = ?1 ORDER BY Position, TagMapId",
+    )?;
+    let rows = stmt.query_map([tag], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Give the `TagMap` rows of `tag` the positions 0..n in `order`. The rows
+/// first move to negative positions so `UNIQUE(TagId, Position)` holds.
+fn renumber(tx: &Transaction<'_>, tag: i64, order: &[(i64, Option<i64>)]) -> Result<()> {
+    tx.execute(
+        "UPDATE TagMap SET Position = -1 - Position WHERE TagId = ?1",
+        [tag],
+    )?;
+    for (position, (tag_map, _)) in order.iter().enumerate() {
+        tx.execute(
+            "UPDATE TagMap SET Position = ?1 WHERE TagMapId = ?2",
+            params![position as i64, tag_map],
+        )?;
+    }
+    Ok(())
+}
+
+/// Delete a playlist item and every row that hangs on it: TagMap, both maps,
+/// markers and their verse and paragraph maps.
+pub(crate) fn delete_item_rows(tx: &Transaction<'_>, item: i64) -> Result<()> {
+    let markers = "SELECT PlaylistItemMarkerId FROM PlaylistItemMarker WHERE PlaylistItemId = ?1";
+    tx.execute("DELETE FROM TagMap WHERE PlaylistItemId = ?1", [item])?;
+    tx.execute(
+        &format!(
+            "DELETE FROM PlaylistItemMarkerBibleVerseMap WHERE PlaylistItemMarkerId IN ({markers})"
+        ),
+        [item],
+    )?;
+    tx.execute(
+        &format!(
+            "DELETE FROM PlaylistItemMarkerParagraphMap WHERE PlaylistItemMarkerId IN ({markers})"
+        ),
+        [item],
+    )?;
+    tx.execute(
+        "DELETE FROM PlaylistItemMarker WHERE PlaylistItemId = ?1",
+        [item],
+    )?;
+    tx.execute(
+        "DELETE FROM PlaylistItemIndependentMediaMap WHERE PlaylistItemId = ?1",
+        [item],
+    )?;
+    tx.execute(
+        "DELETE FROM PlaylistItemLocationMap WHERE PlaylistItemId = ?1",
+        [item],
+    )?;
+    tx.execute("DELETE FROM PlaylistItem WHERE PlaylistItemId = ?1", [item])?;
+    Ok(())
+}
+
+/// Delete every item of the playlist, then its tag.
+pub(crate) fn delete_playlist_rows(tx: &Transaction<'_>, tag: i64) -> Result<()> {
+    let items = {
+        let mut stmt = tx.prepare(
+            "SELECT PlaylistItemId FROM TagMap WHERE TagId = ?1 AND PlaylistItemId IS NOT NULL",
+        )?;
+        stmt.query_map([tag], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for item in items {
+        delete_item_rows(tx, item)?;
+    }
+    tx.execute("DELETE FROM TagMap WHERE TagId = ?1", [tag])?;
+    tx.execute("DELETE FROM Tag WHERE TagId = ?1", [tag])?;
+    Ok(())
+}
+
+/// Delete `IndependentMedia` rows no item or thumbnail uses; returns their
+/// FilePaths.
+fn remove_orphan_media(tx: &Transaction<'_>) -> Result<Vec<String>> {
+    let unused = "FROM IndependentMedia
+        WHERE IndependentMediaId NOT IN
+              (SELECT IndependentMediaId FROM PlaylistItemIndependentMediaMap)
+          AND FilePath NOT IN
+              (SELECT ThumbnailFilePath FROM PlaylistItem WHERE ThumbnailFilePath IS NOT NULL)";
+    let names = {
+        let mut stmt = tx.prepare(&format!("SELECT FilePath {unused}"))?;
+        stmt.query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    tx.execute(&format!("DELETE {unused}"), [])?;
+    Ok(names)
+}
+
+/// Every `IndependentMedia.FilePath` a playlist item uses, as media or as
+/// thumbnail, that is a safe file name; sorted. None without the playlist
+/// tables.
+fn referenced_media(conn: &Connection) -> Result<Vec<String>> {
+    for table in [
+        "IndependentMedia",
+        "PlaylistItem",
+        "PlaylistItemIndependentMediaMap",
+    ] {
+        if !has_table(conn, "main", table)? {
+            return Ok(Vec::new());
+        }
+    }
+    let mut stmt = conn.prepare(
+        "SELECT m.FilePath FROM IndependentMedia m
+         WHERE m.IndependentMediaId IN
+               (SELECT IndependentMediaId FROM PlaylistItemIndependentMediaMap)
+            OR m.FilePath IN
+               (SELECT ThumbnailFilePath FROM PlaylistItem
+                WHERE ThumbnailFilePath IS NOT NULL)
+         ORDER BY m.FilePath",
+    )?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.into_iter().filter(|n| safe_media_name(n)).collect())
+}
+
+/// Write the files `names` from the media directory `dir` into `zip` as
+/// Stored entries of the same name. Unsafe names and files missing here
+/// are left out and logged.
+fn write_media_entries(
+    zip: &mut zip::ZipWriter<File>,
+    dir: &Path,
+    names: &[String],
+    what: &str,
+) -> Result<()> {
+    for name in names {
+        let source = if safe_media_name(name) {
+            File::open(dir.join(name)).ok()
+        } else {
+            None
+        };
+        let Some(mut source) = source else {
+            eprintln!("{what}: media file {name:?} is missing");
+            continue;
+        };
+        let stored = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .large_file(source.metadata()?.len() >= u64::from(u32::MAX));
+        zip.start_file(name.as_str(), stored)?;
+        io::copy(&mut source, zip)?;
+    }
+    Ok(())
+}
+
+/// Copy the media file `src` to `dest` through `dest.part` and a rename.
+/// Whether it was copied; a failure is logged. The stored `Hash` is not
+/// checked against the file.
+fn copy_media_file(src: &Path, dest: &Path) -> bool {
+    File::open(src)
+        .map_err(crate::Error::from)
+        .and_then(|mut file| copy_hashed(&mut file, dest))
+        .inspect_err(|e| eprintln!("could not copy playlist media {}: {e}", src.display()))
+        .is_ok()
+}
+
+/// Remove the files `names` from the media directory `dir`, after the rows
+/// naming them were deleted. Unsafe names are left alone.
+fn remove_media_files(dir: &Path, names: &[String]) {
+    for name in names.iter().filter(|n| safe_media_name(n)) {
+        match fs::remove_file(dir.join(name)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                eprintln!("could not remove playlist media {name:?}: {e}");
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Remove a note with its tags.
@@ -3033,15 +4653,70 @@ fn set_note_tags(tx: &Transaction<'_>, note: i64, tags: &[String]) -> Result<()>
     Ok(())
 }
 
-/// Tables of a new database, laid out like JW Library's schema version 16
-/// (docs/FORMAT.md) so backups made here can be restored there.
-const SCHEMA: &str = "
-CREATE TABLE IndependentMedia(
+/// Playlist and media tables of JW Library's schema version 16. Part of
+/// [`SCHEMA`], and created by `open` (as [`PLAYLIST_SCHEMA`]) on databases
+/// that lack them, like backups of an older JW Library.
+macro_rules! playlist_schema {
+    () => {
+        "
+CREATE TABLE IF NOT EXISTS IndependentMedia(
     IndependentMediaId INTEGER NOT NULL PRIMARY KEY,
     OriginalFilename TEXT NOT NULL,
     FilePath TEXT NOT NULL UNIQUE,
     MimeType TEXT NOT NULL,
     Hash TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS PlaylistItemAccuracy(
+    PlaylistItemAccuracyId INTEGER NOT NULL PRIMARY KEY,
+    Description TEXT NOT NULL UNIQUE);
+INSERT OR IGNORE INTO PlaylistItemAccuracy VALUES (1, 'Accurate'), (2, 'NeedsUserVerification');
+CREATE TABLE IF NOT EXISTS PlaylistItem(
+    PlaylistItemId INTEGER NOT NULL PRIMARY KEY,
+    Label TEXT NOT NULL,
+    StartTrimOffsetTicks INTEGER,
+    EndTrimOffsetTicks INTEGER,
+    Accuracy INTEGER NOT NULL REFERENCES PlaylistItemAccuracy(PlaylistItemAccuracyId),
+    EndAction INTEGER NOT NULL,
+    ThumbnailFilePath TEXT REFERENCES IndependentMedia(FilePath));
+CREATE TABLE IF NOT EXISTS PlaylistItemIndependentMediaMap(
+    PlaylistItemId INTEGER NOT NULL REFERENCES PlaylistItem(PlaylistItemId),
+    IndependentMediaId INTEGER NOT NULL REFERENCES IndependentMedia(IndependentMediaId),
+    DurationTicks INTEGER NOT NULL,
+    PRIMARY KEY(PlaylistItemId, IndependentMediaId)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS PlaylistItemLocationMap(
+    PlaylistItemId INTEGER NOT NULL REFERENCES PlaylistItem(PlaylistItemId),
+    LocationId INTEGER NOT NULL REFERENCES Location(LocationId),
+    MajorMultimediaType INTEGER NOT NULL,
+    BaseDurationTicks INTEGER,
+    PRIMARY KEY(PlaylistItemId, LocationId)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS PlaylistItemMarker(
+    PlaylistItemMarkerId INTEGER NOT NULL PRIMARY KEY,
+    PlaylistItemId INTEGER NOT NULL REFERENCES PlaylistItem(PlaylistItemId),
+    Label TEXT NOT NULL,
+    StartTimeTicks INTEGER NOT NULL,
+    DurationTicks INTEGER NOT NULL,
+    EndTransitionDurationTicks INTEGER NOT NULL,
+    UNIQUE(PlaylistItemId, StartTimeTicks));
+CREATE TABLE IF NOT EXISTS PlaylistItemMarkerBibleVerseMap(
+    PlaylistItemMarkerId INTEGER NOT NULL REFERENCES PlaylistItemMarker(PlaylistItemMarkerId),
+    VerseId INTEGER NOT NULL,
+    PRIMARY KEY(PlaylistItemMarkerId, VerseId)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS PlaylistItemMarkerParagraphMap(
+    PlaylistItemMarkerId INTEGER NOT NULL REFERENCES PlaylistItemMarker(PlaylistItemMarkerId),
+    MepsDocumentId INTEGER NOT NULL,
+    ParagraphIndex INTEGER NOT NULL,
+    MarkerIndexWithinParagraph INTEGER NOT NULL,
+    PRIMARY KEY(PlaylistItemMarkerId, MepsDocumentId, ParagraphIndex, MarkerIndexWithinParagraph))
+    WITHOUT ROWID;
+"
+    };
+}
+const PLAYLIST_SCHEMA: &str = playlist_schema!();
+
+/// Tables of a new database, laid out like JW Library's schema version 16
+/// (docs/FORMAT.md) so backups made here can be restored there.
+const SCHEMA: &str = concat!(
+    playlist_schema!(),
+    "
 CREATE TABLE LastModified(LastModified TEXT NOT NULL);
 INSERT INTO LastModified VALUES (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'));
 CREATE TABLE Location(
@@ -3098,48 +4773,6 @@ CREATE TABLE Note(
     Created TEXT NOT NULL DEFAULT(strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     BlockType INTEGER NOT NULL DEFAULT 0,
     BlockIdentifier INTEGER);
-CREATE TABLE PlaylistItemAccuracy(
-    PlaylistItemAccuracyId INTEGER NOT NULL PRIMARY KEY,
-    Description TEXT NOT NULL UNIQUE);
-INSERT INTO PlaylistItemAccuracy VALUES (1, 'Accurate'), (2, 'NeedsUserVerification');
-CREATE TABLE PlaylistItem(
-    PlaylistItemId INTEGER NOT NULL PRIMARY KEY,
-    Label TEXT NOT NULL,
-    StartTrimOffsetTicks INTEGER,
-    EndTrimOffsetTicks INTEGER,
-    Accuracy INTEGER NOT NULL REFERENCES PlaylistItemAccuracy(PlaylistItemAccuracyId),
-    EndAction INTEGER NOT NULL,
-    ThumbnailFilePath TEXT REFERENCES IndependentMedia(FilePath));
-CREATE TABLE PlaylistItemIndependentMediaMap(
-    PlaylistItemId INTEGER NOT NULL REFERENCES PlaylistItem(PlaylistItemId),
-    IndependentMediaId INTEGER NOT NULL REFERENCES IndependentMedia(IndependentMediaId),
-    DurationTicks INTEGER NOT NULL,
-    PRIMARY KEY(PlaylistItemId, IndependentMediaId)) WITHOUT ROWID;
-CREATE TABLE PlaylistItemLocationMap(
-    PlaylistItemId INTEGER NOT NULL REFERENCES PlaylistItem(PlaylistItemId),
-    LocationId INTEGER NOT NULL REFERENCES Location(LocationId),
-    MajorMultimediaType INTEGER NOT NULL,
-    BaseDurationTicks INTEGER,
-    PRIMARY KEY(PlaylistItemId, LocationId)) WITHOUT ROWID;
-CREATE TABLE PlaylistItemMarker(
-    PlaylistItemMarkerId INTEGER NOT NULL PRIMARY KEY,
-    PlaylistItemId INTEGER NOT NULL REFERENCES PlaylistItem(PlaylistItemId),
-    Label TEXT NOT NULL,
-    StartTimeTicks INTEGER NOT NULL,
-    DurationTicks INTEGER NOT NULL,
-    EndTransitionDurationTicks INTEGER NOT NULL,
-    UNIQUE(PlaylistItemId, StartTimeTicks));
-CREATE TABLE PlaylistItemMarkerBibleVerseMap(
-    PlaylistItemMarkerId INTEGER NOT NULL REFERENCES PlaylistItemMarker(PlaylistItemMarkerId),
-    VerseId INTEGER NOT NULL,
-    PRIMARY KEY(PlaylistItemMarkerId, VerseId)) WITHOUT ROWID;
-CREATE TABLE PlaylistItemMarkerParagraphMap(
-    PlaylistItemMarkerId INTEGER NOT NULL REFERENCES PlaylistItemMarker(PlaylistItemMarkerId),
-    MepsDocumentId INTEGER NOT NULL,
-    ParagraphIndex INTEGER NOT NULL,
-    MarkerIndexWithinParagraph INTEGER NOT NULL,
-    PRIMARY KEY(PlaylistItemMarkerId, MepsDocumentId, ParagraphIndex, MarkerIndexWithinParagraph))
-    WITHOUT ROWID;
 CREATE TABLE Tag(
     TagId INTEGER NOT NULL PRIMARY KEY,
     Type INTEGER NOT NULL,
@@ -3161,7 +4794,8 @@ CREATE INDEX IX_UserMark_LocationId ON UserMark(LocationId);
 CREATE INDEX IX_Note_LocationId_BlockIdentifier ON Note(LocationId, BlockIdentifier);
 CREATE INDEX IX_TagMap_NoteId_TagId_Position ON TagMap(NoteId, TagId, Position);
 CREATE INDEX IX_Location_MepsLanguage_DocumentId ON Location(MepsLanguage, DocumentId);
-";
+"
+);
 
 #[cfg(test)]
 mod tests {
@@ -3966,6 +5600,43 @@ mod tests {
             dest.answers(&bible(23)).unwrap().get("a").unwrap(),
             "answer"
         );
+    }
+
+    #[test]
+    fn restore_without_playlist_tables_initializes_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = UserData::open(tmp.path().join("source").join(DB_NAME)).unwrap();
+        source
+            .conn
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE PlaylistItemMarkerParagraphMap;
+                 DROP TABLE PlaylistItemMarkerBibleVerseMap;
+                 DROP TABLE PlaylistItemMarker;
+                 DROP TABLE PlaylistItemLocationMap;
+                 DROP TABLE PlaylistItemIndependentMediaMap;
+                 DROP TABLE PlaylistItem;
+                 DROP TABLE PlaylistItemAccuracy;
+                 DROP TABLE IndependentMedia;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        let backup = tmp.path().join("backup.jwlibrary");
+        source.export_backup(&backup).unwrap();
+        let mut dest = UserData::open(tmp.path().join("dest").join(DB_NAME)).unwrap();
+        dest.restore_backup(&backup).unwrap();
+        dest.fingerprint().unwrap();
+        assert!(dest.playlists().unwrap().is_empty());
+        let id = dest.create_playlist("Songs").unwrap();
+        assert_eq!(dest.playlist(id).unwrap().name, "Songs");
+        assert_eq!(
+            dest.conn
+                .query_row("SELECT count(*) FROM PlaylistItemAccuracy", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_foreign_keys_hold(&dest);
     }
 
     #[test]
@@ -6162,6 +7833,1780 @@ mod tests {
         }
     }
 
+    mod playlists {
+        use super::*;
+        use crate::playlist::{ItemKind, ItemSource, LibraryRef, PlaylistSummary, ios_hash};
+
+        fn open(tmp: &Path) -> UserData {
+            UserData::open(tmp.join(DB_NAME)).unwrap()
+        }
+
+        fn is_invalid<T: std::fmt::Debug>(r: Result<T>) -> bool {
+            matches!(r, Err(Error::Invalid(_)))
+        }
+
+        fn summary(id: i64, name: &str, items: i64) -> PlaylistSummary {
+            PlaylistSummary {
+                id,
+                name: name.into(),
+                items,
+                duration_ticks: 0,
+                thumbnail: None,
+            }
+        }
+
+        /// An `IndependentMedia` row named `file`; returns its id.
+        fn media(ud: &UserData, file: &str, mime: &str) -> i64 {
+            ud.conn
+                .execute(
+                    "INSERT INTO IndependentMedia (OriginalFilename, FilePath, MimeType, Hash)
+                     VALUES (?1, ?1, ?2, 'ab')",
+                    params![file, mime],
+                )
+                .unwrap();
+            ud.conn.last_insert_rowid()
+        }
+
+        fn item(ud: &UserData, tag: i64, position: i64, label: &str, thumb: Option<&str>) -> i64 {
+            ud.conn
+                .execute(
+                    "INSERT INTO PlaylistItem (Label, Accuracy, EndAction, ThumbnailFilePath)
+                     VALUES (?1, 1, 0, ?2)",
+                    params![label, thumb],
+                )
+                .unwrap();
+            let id = ud.conn.last_insert_rowid();
+            ud.conn
+                .execute(
+                    "INSERT INTO TagMap (PlaylistItemId, TagId, Position) VALUES (?1, ?2, ?3)",
+                    params![id, tag, position],
+                )
+                .unwrap();
+            id
+        }
+
+        /// A file item using the media row `media`.
+        fn file_item(
+            ud: &UserData,
+            tag: i64,
+            position: i64,
+            media: i64,
+            thumb: Option<&str>,
+        ) -> i64 {
+            let id = item(ud, tag, position, "photo.png", thumb);
+            ud.conn
+                .execute(
+                    "INSERT INTO PlaylistItemIndependentMediaMap
+                     (PlaylistItemId, IndependentMediaId, DurationTicks) VALUES (?1, ?2, 40000000)",
+                    params![id, media],
+                )
+                .unwrap();
+            id
+        }
+
+        /// Song `track` of `sjjm` as a library item with `Location.Type` `kind`.
+        pub(super) fn labels(ud: &UserData, tag: i64) -> Vec<String> {
+            ud.playlist(tag)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|i| i.label)
+                .collect()
+        }
+
+        fn library_item(ud: &UserData, tag: i64, position: i64, track: i64, kind: i64) -> i64 {
+            let id = item(ud, tag, position, "Song", None);
+            ud.conn
+                .execute(
+                    "INSERT INTO Location (KeySymbol, Track, MepsLanguage, IssueTagNumber, Type)
+                     VALUES ('sjjm', ?1, 2, 0, ?2)",
+                    params![track, kind],
+                )
+                .unwrap();
+            let location = ud.conn.last_insert_rowid();
+            ud.conn
+                .execute(
+                    "INSERT INTO PlaylistItemLocationMap
+                     (PlaylistItemId, LocationId, MajorMultimediaType, BaseDurationTicks)
+                     VALUES (?1, ?2, 0, 1378840000)",
+                    params![id, location],
+                )
+                .unwrap();
+            id
+        }
+
+        fn positions(ud: &UserData, tag: i64) -> Vec<(i64, i64)> {
+            let mut stmt = ud
+                .conn
+                .prepare(
+                    "SELECT PlaylistItemId, Position FROM TagMap WHERE TagId = ?1 ORDER BY Position",
+                )
+                .unwrap();
+            stmt.query_map([tag], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        fn item_ids(ud: &UserData, tag: i64) -> Vec<i64> {
+            ud.playlist(tag)
+                .unwrap()
+                .items
+                .iter()
+                .map(|i| i.id)
+                .collect()
+        }
+
+        #[test]
+        fn create_list_rename_delete() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let id = ud.create_playlist(" Songs ").unwrap();
+            assert_eq!(ud.playlists().unwrap(), [summary(id, "Songs", 0)]);
+            assert!(is_invalid(ud.create_playlist("Songs")));
+            assert!(is_invalid(ud.create_playlist("  ")));
+            let other = ud.create_playlist("Videos").unwrap();
+            assert!(is_invalid(ud.rename_playlist(other, "Songs ")));
+            assert!(is_invalid(ud.rename_playlist(other, "")));
+            ud.rename_playlist(other, "Abend").unwrap();
+            assert_eq!(
+                ud.playlists().unwrap(),
+                [summary(other, "Abend", 0), summary(id, "Songs", 0)]
+            );
+            assert_eq!(ud.playlist(id).unwrap().name, "Songs");
+            assert!(matches!(ud.playlist(999), Err(Error::NotFound(_))));
+            ud.delete_playlist(id).unwrap();
+            ud.delete_playlist(other).unwrap();
+            assert_eq!(
+                ud.conn
+                    .query_row("SELECT count(*) FROM Tag WHERE Type = 2", [], |r| r
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert!(ud.playlists().unwrap().is_empty());
+        }
+
+        #[test]
+        fn reads_jw_library_backup_with_empty_playlist() {
+            let tmp = tempfile::tempdir().unwrap();
+            // Like the iPhone backup: user tags, favorites and one type-2
+            // tag "Songs" without items.
+            let mut source = open(&tmp.path().join("iphone"));
+            source
+                .save_note(Some(&bible(3)), None, &note_input("T", "C", &["Mut"]))
+                .unwrap();
+            source
+                .set_favorite(&publication_key("nwtsty", 2, 0), true)
+                .unwrap();
+            source
+                .conn
+                .execute("INSERT INTO Tag (Type, Name) VALUES (2, 'Songs')", [])
+                .unwrap();
+            let backup = backup_of(&source, tmp.path(), "iphone.jwlibrary");
+
+            let mut ud = open(&tmp.path().join("here"));
+            let restored = ud.restore_backup(&backup).unwrap();
+            assert_eq!(restored.playlists, 1);
+            let lists = ud.playlists().unwrap();
+            assert_eq!(lists.len(), 1);
+            assert_eq!(lists[0], summary(lists[0].id, "Songs", 0));
+            let s = ud.summary().unwrap();
+            assert_eq!((s.playlists, s.tags), (1, 1));
+        }
+
+        #[test]
+        fn reads_items_in_position_order() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Mixed").unwrap();
+            let song = library_item(&ud, tag, 1, 7, 3);
+            let png = media(&ud, "A1.png", "image/png");
+            let photo = file_item(&ud, tag, 0, png, None);
+
+            let list = ud.playlist(tag).unwrap();
+            assert_eq!(
+                list.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+                [photo, song]
+            );
+            let first = &list.items[0];
+            assert_eq!(first.kind, ItemKind::Image);
+            assert_eq!(first.duration_ticks, 40_000_000);
+            assert_eq!(first.end_action, 0);
+            let path = ud.playlist_media_dir().join("A1.png");
+            assert_eq!(
+                first.source,
+                ItemSource::File {
+                    path: path.clone(),
+                    mime: "image/png".into(),
+                    available: false
+                }
+            );
+            let second = &list.items[1];
+            assert_eq!(second.kind, ItemKind::Video);
+            assert_eq!(second.duration_ticks, 1_378_840_000);
+            assert_eq!(
+                second.source,
+                ItemSource::Library {
+                    key_symbol: "sjjm".into(),
+                    track: 7,
+                    issue_tag: 0,
+                    meps_language: 2,
+                    kind: ItemKind::Video
+                }
+            );
+            assert_eq!(ud.playlists().unwrap()[0].items, 2);
+            assert_eq!(
+                ud.playlists().unwrap()[0].duration_ticks,
+                1_378_840_000 + 40_000_000
+            );
+
+            fs::create_dir_all(ud.playlist_media_dir()).unwrap();
+            fs::write(&path, b"png").unwrap();
+            assert!(matches!(
+                ud.playlist(tag).unwrap().items[0].source,
+                ItemSource::File {
+                    available: true,
+                    ..
+                }
+            ));
+        }
+
+        #[test]
+        fn move_renumbers() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Songs").unwrap();
+            let a = library_item(&ud, tag, 0, 1, 2);
+            let b = library_item(&ud, tag, 1, 2, 2);
+            let c = library_item(&ud, tag, 2, 3, 2);
+            ud.move_playlist_item(tag, c, 0).unwrap();
+            assert_eq!(item_ids(&ud, tag), [c, a, b]);
+            assert_eq!(positions(&ud, tag), [(c, 0), (a, 1), (b, 2)]);
+            ud.move_playlist_item(tag, c, 2).unwrap();
+            assert_eq!(positions(&ud, tag), [(a, 0), (b, 1), (c, 2)]);
+            assert!(is_invalid(ud.move_playlist_item(tag, c, -1)));
+            assert!(is_invalid(ud.move_playlist_item(tag, c, 3)));
+            assert_eq!(positions(&ud, tag), [(a, 0), (b, 1), (c, 2)]);
+            assert!(matches!(
+                ud.move_playlist_item(tag, 999, 0),
+                Err(Error::NotFound(_))
+            ));
+
+            ud.remove_playlist_item(a).unwrap();
+            assert_eq!(positions(&ud, tag), [(b, 0), (c, 1)]);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn remove_and_delete_clean_media() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let dir = ud.playlist_media_dir();
+            fs::create_dir_all(&dir).unwrap();
+            for name in ["A.png", "T.jpg", "M.png", "STRAY.png"] {
+                fs::write(dir.join(name), name).unwrap();
+            }
+            let tag = ud.create_playlist("Photos").unwrap();
+            let own = media(&ud, "A.png", "image/png");
+            media(&ud, "T.jpg", "image/jpeg");
+            let a = file_item(&ud, tag, 0, own, Some("T.jpg"));
+            // A marker with its verse and paragraph maps hangs on the item.
+            ud.conn
+                .execute_batch(&format!(
+                    "INSERT INTO PlaylistItemMarker (PlaylistItemId, Label, StartTimeTicks,
+                         DurationTicks, EndTransitionDurationTicks) VALUES ({a}, 'm', 0, 1, 0);
+                     INSERT INTO PlaylistItemMarkerBibleVerseMap VALUES (last_insert_rowid(), 1);
+                     INSERT INTO PlaylistItemMarkerParagraphMap
+                         SELECT PlaylistItemMarkerId, 1, 1, 0 FROM PlaylistItemMarker;"
+                ))
+                .unwrap();
+            let shared = media(&ud, "M.png", "image/png");
+            let b = file_item(&ud, tag, 1, shared, None);
+            file_item(&ud, tag, 2, shared, Some("M.png"));
+            let thumb = &ud.playlist(tag).unwrap().items[0].thumbnail;
+            assert_eq!(thumb.as_deref(), Some(dir.join("T.jpg").as_path()));
+            assert_eq!(
+                ud.playlists().unwrap()[0].thumbnail,
+                Some(dir.join("T.jpg"))
+            );
+
+            ud.remove_playlist_item(a).unwrap();
+            assert!(!dir.join("A.png").exists());
+            assert!(!dir.join("T.jpg").exists());
+            assert!(dir.join("STRAY.png").exists());
+            assert_eq!(count(&ud, "IndependentMedia"), 1);
+            assert_eq!(count(&ud, "PlaylistItemMarker"), 0);
+            assert_eq!(count(&ud, "PlaylistItemMarkerBibleVerseMap"), 0);
+            assert_eq!(count(&ud, "PlaylistItemMarkerParagraphMap"), 0);
+            assert_foreign_keys_hold(&ud);
+
+            ud.remove_playlist_item(b).unwrap();
+            assert!(dir.join("M.png").exists());
+            assert_eq!(count(&ud, "IndependentMedia"), 1);
+
+            ud.delete_playlist(tag).unwrap();
+            assert!(!dir.join("M.png").exists());
+            assert!(dir.join("STRAY.png").exists());
+            assert_eq!(count(&ud, "IndependentMedia"), 0);
+            assert_eq!(count(&ud, "PlaylistItem"), 0);
+            assert_eq!(count(&ud, "PlaylistItemIndependentMediaMap"), 0);
+            assert_eq!(count(&ud, "TagMap"), 0);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn writes_move_fingerprint_and_clock() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let old = "2001-01-01T00:00:00Z";
+            let check = |ud: &mut UserData, write: &dyn Fn(&mut UserData)| {
+                set_db_time(ud, old);
+                let before = ud.fingerprint().unwrap();
+                write(ud);
+                assert_ne!(ud.fingerprint().unwrap(), before);
+                assert_ne!(db_time(ud), old);
+            };
+            check(&mut ud, &|ud| {
+                ud.create_playlist("Songs").unwrap();
+            });
+            let tag = ud.playlists().unwrap()[0].id;
+            check(&mut ud, &|ud| ud.rename_playlist(tag, "Lieder").unwrap());
+            let a = library_item(&ud, tag, 0, 1, 2);
+            library_item(&ud, tag, 1, 2, 2);
+            check(&mut ud, &|ud| ud.move_playlist_item(tag, a, 1).unwrap());
+            check(&mut ud, &|ud| ud.remove_playlist_item(a).unwrap());
+            check(&mut ud, &|ud| {
+                ud.add_library_item(tag, &song("sjjm", ItemKind::Audio), "Song", 1)
+                    .unwrap();
+            });
+            let mov = ud.path().with_file_name("clip.mov");
+            fs::write(&mov, b"moov").unwrap();
+            check(&mut ud, &|ud| {
+                ud.add_file_item(tag, &mov).unwrap();
+            });
+            let video = item_ids(&ud, tag)[2];
+            check(&mut ud, &|ud| {
+                ud.set_playlist_item_duration(video, 9).unwrap()
+            });
+            check(&mut ud, &|ud| {
+                ud.set_playlist_item_thumbnail(video, b"jpeg").unwrap()
+            });
+            check(&mut ud, &|ud| ud.delete_playlist(tag).unwrap());
+        }
+
+        fn song(key_symbol: &str, kind: ItemKind) -> LibraryRef {
+            LibraryRef {
+                key_symbol: key_symbol.into(),
+                track: 1,
+                issue_tag: 0,
+                meps_language: 2,
+                kind,
+            }
+        }
+
+        /// `(Type, Track, KeySymbol, MepsLanguage, IssueTagNumber)` of every Location.
+        fn locations(ud: &UserData) -> Vec<(i64, i64, String, i64, i64)> {
+            let mut stmt = ud
+                .conn
+                .prepare(
+                    "SELECT Type, Track, KeySymbol, MepsLanguage, IssueTagNumber
+                     FROM Location ORDER BY LocationId",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        }
+
+        /// `(MajorMultimediaType, BaseDurationTicks)` of `item`.
+        fn location_map(ud: &UserData, item: i64) -> (i64, i64) {
+            ud.conn
+                .query_row(
+                    "SELECT MajorMultimediaType, BaseDurationTicks
+                     FROM PlaylistItemLocationMap WHERE PlaylistItemId = ?1",
+                    [item],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        }
+
+        /// `(Label, Accuracy, EndAction, StartTrim, EndTrim)` of `item`.
+        fn item_row(ud: &UserData, item: i64) -> (String, i64, i64, Option<i64>, Option<i64>) {
+            ud.conn
+                .query_row(
+                    "SELECT Label, Accuracy, EndAction, StartTrimOffsetTicks, EndTrimOffsetTicks
+                     FROM PlaylistItem WHERE PlaylistItemId = ?1",
+                    [item],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn adds_library_audio_like_jw_library() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Songs").unwrap();
+            let label = "1. Jehovas großartige Eigenschaften";
+            let a = ud
+                .add_library_item(tag, &song("sjjm", ItemKind::Audio), label, 1_378_840_000)
+                .unwrap();
+            assert_eq!(locations(&ud), [(2, 1, "sjjm".into(), 2, 0)]);
+            assert_eq!(location_map(&ud, a), (0, 1_378_840_000));
+            assert_eq!(item_row(&ud, a), (label.into(), 1, 0, None, None));
+            assert_eq!(positions(&ud, tag), [(a, 0)]);
+
+            let b = ud
+                .add_library_item(tag, &song("sjjm", ItemKind::Audio), label, 1_378_840_000)
+                .unwrap();
+            assert_eq!(locations(&ud).len(), 1);
+            assert_eq!(positions(&ud, tag), [(a, 0), (b, 1)]);
+            let items = ud.playlist(tag).unwrap().items;
+            assert_eq!(items[1].kind, ItemKind::Audio);
+            assert_eq!(items[1].duration_ticks, 1_378_840_000);
+
+            assert!(is_invalid(ud.add_library_item(
+                tag,
+                &song("sjjm", ItemKind::Audio),
+                " ",
+                0
+            )));
+            assert!(is_invalid(ud.add_library_item(
+                tag,
+                &song("sjjm", ItemKind::Image),
+                label,
+                0
+            )));
+            assert!(matches!(
+                ud.add_library_item(999, &song("sjjm", ItemKind::Audio), label, 0),
+                Err(Error::NotFound(_))
+            ));
+            assert_eq!(count(&ud, "PlaylistItem"), 2);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn adds_library_video() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Videos").unwrap();
+            let a = ud
+                .add_library_item(
+                    tag,
+                    &song("jwb-143", ItemKind::Video),
+                    "JW Broadcasting November 2026",
+                    36_009_720_000,
+                )
+                .unwrap();
+            assert_eq!(locations(&ud), [(3, 1, "jwb-143".into(), 2, 0)]);
+            assert_eq!(location_map(&ud, a), (2, 36_009_720_000));
+            assert_eq!(ud.playlist(tag).unwrap().items[0].kind, ItemKind::Video);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        /// `(OriginalFilename, FilePath, MimeType, Hash, DurationTicks)` of file item `item`.
+        pub(super) fn media_of(ud: &UserData, item: i64) -> (String, String, String, String, i64) {
+            ud.conn
+                .query_row(
+                    "SELECT m.OriginalFilename, m.FilePath, m.MimeType, m.Hash, im.DurationTicks
+                     FROM PlaylistItemIndependentMediaMap im
+                     JOIN IndependentMedia m ON m.IndependentMediaId = im.IndependentMediaId
+                     WHERE im.PlaylistItemId = ?1",
+                    [item],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                )
+                .unwrap()
+        }
+
+        fn is_guid_name(name: &str, ext: &str) -> bool {
+            let Some(guid) = name.strip_suffix(ext) else {
+                return false;
+            };
+            guid.len() == 36
+                && guid
+                    .chars()
+                    .all(|c| c == '-' || c.is_ascii_digit() || ('A'..='F').contains(&c))
+        }
+
+        #[test]
+        fn adds_own_files() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Mine").unwrap();
+            let src = tmp.path().join("src");
+            fs::create_dir_all(&src).unwrap();
+
+            let txt = src.join("notes.txt");
+            fs::write(&txt, b"text").unwrap();
+            assert!(is_invalid(ud.add_file_item(tag, &txt)));
+            assert_eq!(count(&ud, "PlaylistItem"), 0);
+            assert_eq!(count(&ud, "IndependentMedia"), 0);
+            assert_eq!(count(&ud, "TagMap"), 0);
+            let dir = ud.playlist_media_dir();
+            assert!(!dir.exists() || fs::read_dir(&dir).unwrap().next().is_none());
+
+            let png = src.join("IMG_3019.PNG");
+            let content = b"\x89PNG not really".to_vec();
+            fs::write(&png, &content).unwrap();
+            let photo = ud.add_file_item(tag, &png).unwrap();
+            assert_eq!(
+                item_row(&ud, photo),
+                ("IMG_3019.PNG".into(), 1, 0, None, None)
+            );
+            let (original, path, mime, hash, ticks) = media_of(&ud, photo);
+            assert!(is_guid_name(&original, ".png"), "{original}");
+            assert!(is_guid_name(&path, ".png"), "{path}");
+            assert_eq!(mime, "image/png");
+            assert_eq!(hash, ios_hash(&Sha256::digest(&content)));
+            assert_eq!(ticks, 40_000_000);
+            assert_eq!(fs::read(dir.join(&path)).unwrap(), content);
+
+            let mov = src.join("IMG_2974.mov");
+            fs::write(&mov, b"moov").unwrap();
+            let video = ud.add_file_item(tag, &mov).unwrap();
+            assert_eq!(media_of(&ud, video).2, "video/quicktime");
+            assert_eq!(media_of(&ud, video).4, 0);
+            ud.set_playlist_item_duration(video, 139_000_000).unwrap();
+            assert_eq!(media_of(&ud, video).4, 139_000_000);
+            let items = ud.playlist(tag).unwrap().items;
+            assert_eq!(items[1].kind, ItemKind::Video);
+            assert_eq!(items[1].duration_ticks, 139_000_000);
+            assert_eq!(positions(&ud, tag), [(photo, 0), (video, 1)]);
+
+            assert!(is_invalid(ud.set_playlist_item_duration(photo, 1)));
+            assert_eq!(media_of(&ud, photo).4, 40_000_000);
+            let song = ud
+                .add_library_item(tag, &song("sjjm", ItemKind::Audio), "Song", 5)
+                .unwrap();
+            assert!(is_invalid(ud.set_playlist_item_duration(song, 1)));
+            assert!(matches!(
+                ud.set_playlist_item_duration(999, 1),
+                Err(Error::NotFound(_))
+            ));
+            assert!(matches!(
+                ud.add_file_item(999, &png),
+                Err(Error::NotFound(_))
+            ));
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn file_item_db_failure_removes_the_copy() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Mine").unwrap();
+            let png = tmp.path().join("a.png");
+            fs::write(&png, b"png").unwrap();
+            ud.conn
+                .execute_batch(
+                    "CREATE TRIGGER no_media BEFORE INSERT ON IndependentMedia
+                     BEGIN SELECT RAISE(ABORT, 'no'); END;",
+                )
+                .unwrap();
+            assert!(matches!(ud.add_file_item(tag, &png), Err(Error::Sqlite(_))));
+            let dir = ud.playlist_media_dir();
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            assert_eq!(count(&ud, "PlaylistItem"), 0);
+        }
+
+        #[test]
+        fn staged_file_is_copied_without_the_database() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Mine").unwrap();
+            let dir = ud.playlist_media_dir();
+            let png = tmp.path().join("IMG_1.PNG");
+            fs::write(&png, b"png bytes").unwrap();
+            let txt = tmp.path().join("notes.txt");
+            fs::write(&txt, b"text").unwrap();
+            assert!(is_invalid(stage_file_item(&dir, &txt)));
+            assert!(!dir.exists() || fs::read_dir(&dir).unwrap().next().is_none());
+
+            let staged = stage_file_item(&dir, &png).unwrap();
+            let files: Vec<String> = fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            assert_eq!(files.len(), 1);
+            assert!(is_guid_name(&files[0], ".png"), "{}", files[0]);
+            assert_eq!(count(&ud, "PlaylistItem"), 0, "nothing written yet");
+
+            let item = ud.add_staged_file(tag, staged).unwrap();
+            let (original, path, mime, hash, ticks) = media_of(&ud, item);
+            assert_eq!((&original, &path), (&files[0], &files[0]));
+            assert_eq!(mime, "image/png");
+            assert_eq!(hash, ios_hash(&Sha256::digest(b"png bytes")));
+            assert_eq!(ticks, 40_000_000);
+            assert_eq!(item_row(&ud, item).0, "IMG_1.PNG");
+            assert_eq!(fs::read(dir.join(&path)).unwrap(), b"png bytes");
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn staged_file_is_removed_when_the_transaction_fails() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Mine").unwrap();
+            let dir = ud.playlist_media_dir();
+            let png = tmp.path().join("a.png");
+            fs::write(&png, b"png").unwrap();
+
+            // The playlist is deleted while the file is copied.
+            let staged = stage_file_item(&dir, &png).unwrap();
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+            ud.delete_playlist(tag).unwrap();
+            assert!(matches!(
+                ud.add_staged_file(tag, staged),
+                Err(Error::NotFound(_))
+            ));
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+
+            let tag = ud.create_playlist("Mine").unwrap();
+            ud.conn
+                .execute_batch(
+                    "CREATE TRIGGER no_item BEFORE INSERT ON TagMap
+                     BEGIN SELECT RAISE(ABORT, 'no'); END;",
+                )
+                .unwrap();
+            let staged = stage_file_item(&dir, &png).unwrap();
+            assert!(matches!(
+                ud.add_staged_file(tag, staged),
+                Err(Error::Sqlite(_))
+            ));
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+            assert_eq!(count(&ud, "PlaylistItem"), 0);
+            assert_eq!(count(&ud, "IndependentMedia"), 0);
+
+            // A staged file that is never added is removed too.
+            drop(stage_file_item(&dir, &png).unwrap());
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        }
+
+        fn thumbnail_of(ud: &UserData, item: i64) -> Option<String> {
+            ud.conn
+                .query_row(
+                    "SELECT ThumbnailFilePath FROM PlaylistItem WHERE PlaylistItemId = ?1",
+                    [item],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        }
+
+        #[test]
+        fn thumbnail_replaces_old() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(tmp.path());
+            let tag = ud.create_playlist("Songs").unwrap();
+            let item = ud
+                .add_library_item(tag, &song("sjjm", ItemKind::Audio), "Song", 5)
+                .unwrap();
+            let dir = ud.playlist_media_dir();
+
+            ud.set_playlist_item_thumbnail(item, b"first jpeg").unwrap();
+            let first = thumbnail_of(&ud, item).unwrap();
+            assert!(is_guid_name(&first, ""), "{first}");
+            assert_eq!(fs::read(dir.join(&first)).unwrap(), b"first jpeg");
+
+            let second_bytes = b"second jpeg";
+            ud.set_playlist_item_thumbnail(item, second_bytes).unwrap();
+            let second = thumbnail_of(&ud, item).unwrap();
+            assert_ne!(first, second);
+            assert!(!dir.join(&first).exists());
+            assert_eq!(fs::read(dir.join(&second)).unwrap(), second_bytes);
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+            let row: (String, String, String, String) = ud
+                .conn
+                .query_row(
+                    "SELECT OriginalFilename, FilePath, MimeType, Hash FROM IndependentMedia",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                row,
+                (
+                    second.clone(),
+                    second.clone(),
+                    "image/jpeg".into(),
+                    ios_hash(&Sha256::digest(second_bytes))
+                )
+            );
+            assert_eq!(count(&ud, "IndependentMedia"), 1);
+            assert_eq!(
+                ud.playlist(tag).unwrap().items[0].thumbnail,
+                Some(dir.join(&second))
+            );
+
+            let big = vec![0u8; 2 * 1024 * 1024 + 1];
+            assert!(matches!(
+                ud.set_playlist_item_thumbnail(item, &big),
+                Err(Error::TooLarge(_))
+            ));
+            assert_eq!(thumbnail_of(&ud, item), Some(second.clone()));
+            assert!(matches!(
+                ud.set_playlist_item_thumbnail(999, b"x"),
+                Err(Error::NotFound(_))
+            ));
+            assert_eq!(count(&ud, "IndependentMedia"), 1);
+            assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        const PHOTO: &str = "D5D214AC-7584-4E32-BB72-D2AB75AFED6E.png";
+        const MOV: &str = "EDB6A882-2CF0-482C-A3E1-4771B71491FC.mov";
+        const THUMBS: [&str; 4] = [
+            "06D2E671-01A0-49C8-9642-DCFA28BF20E7.jpeg",
+            "4782EE3E-0366-4379-AF89-F9AC49C5C6BE.jpeg",
+            "2C4646A7-18DA-4BC3-A186-33A129645B4E.jpeg",
+            "A1B0B64C-20FA-4163-A2A5-3F9E41842C05.jpeg",
+        ];
+
+        /// A file in `ud`'s media directory with its `IndependentMedia` row;
+        /// returns the row id.
+        fn stored_media(
+            ud: &UserData,
+            name: &str,
+            original: &str,
+            mime: &str,
+            bytes: &[u8],
+        ) -> i64 {
+            let dir = ud.playlist_media_dir();
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join(name), bytes).unwrap();
+            ud.conn
+                .execute(
+                    "INSERT INTO IndependentMedia (OriginalFilename, FilePath, MimeType, Hash)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![original, name, mime, ios_hash(&Sha256::digest(bytes))],
+                )
+                .unwrap();
+            ud.conn.last_insert_rowid()
+        }
+
+        fn map_media(ud: &UserData, item: i64, media: i64, ticks: i64) {
+            ud.conn
+                .execute(
+                    "INSERT INTO PlaylistItemIndependentMediaMap
+                     (PlaylistItemId, IndependentMediaId, DurationTicks) VALUES (?1, ?2, ?3)",
+                    params![item, media, ticks],
+                )
+                .unwrap();
+        }
+
+        fn set_thumb(ud: &UserData, item: i64, name: &str) {
+            ud.conn
+                .execute(
+                    "UPDATE PlaylistItem SET ThumbnailFilePath = ?1 WHERE PlaylistItemId = ?2",
+                    params![name, item],
+                )
+                .unwrap();
+        }
+
+        /// The four kinds of the JW Library sample, each with a thumbnail:
+        /// a song, a Broadcasting video, a photo and an own video (with
+        /// trims, an end action and a marker).
+        fn sample_playlist(ud: &mut UserData, name: &str) -> i64 {
+            let tag = ud.create_playlist(name).unwrap();
+            for (i, thumb) in THUMBS.iter().enumerate() {
+                let bytes = format!("jpeg {i}");
+                stored_media(
+                    ud,
+                    thumb,
+                    &format!("THUMB-{i}"),
+                    "image/jpeg",
+                    bytes.as_bytes(),
+                );
+            }
+            let audio = ud
+                .add_library_item(
+                    tag,
+                    &song("sjjm", ItemKind::Audio),
+                    "1. Jehovas großartige Eigenschaften",
+                    1_378_840_000,
+                )
+                .unwrap();
+            let video = ud
+                .add_library_item(
+                    tag,
+                    &song("jwb-143", ItemKind::Video),
+                    "JW Broadcasting November 2026",
+                    36_009_720_000,
+                )
+                .unwrap();
+            let png = stored_media(
+                ud,
+                PHOTO,
+                "41B9A189-A440-47CB-865E-4B83A420D92B.png",
+                "image/png",
+                b"png bytes",
+            );
+            let photo = item(ud, tag, 2, "IMG_3019.png", None);
+            map_media(ud, photo, png, 40_000_000);
+            let mov = stored_media(
+                ud,
+                MOV,
+                "3646BE69-E18A-4F83-937A-7F7E6391EA9B.mov",
+                "video/quicktime",
+                &vec![7u8; 300_000],
+            );
+            let own = item(ud, tag, 3, "IMG_2974.mov", None);
+            map_media(ud, own, mov, 139_000_000);
+            for (item, thumb) in [audio, video, photo, own].into_iter().zip(THUMBS) {
+                set_thumb(ud, item, thumb);
+            }
+            ud.conn
+                .execute(
+                    "UPDATE PlaylistItem SET StartTrimOffsetTicks = 10000000,
+                         EndTrimOffsetTicks = 20000000, EndAction = 2, Accuracy = 2
+                     WHERE PlaylistItemId = ?1",
+                    [own],
+                )
+                .unwrap();
+            ud.conn
+                .execute(
+                    "INSERT INTO PlaylistItemMarker (PlaylistItemId, Label, StartTimeTicks,
+                         DurationTicks, EndTransitionDurationTicks)
+                     VALUES (?1, 'Intro', 0, 50000000, 0)",
+                    [own],
+                )
+                .unwrap();
+            let marker = ud.conn.last_insert_rowid();
+            ud.conn
+                .execute(
+                    "INSERT INTO PlaylistItemMarkerBibleVerseMap VALUES (?1, 40001001)",
+                    [marker],
+                )
+                .unwrap();
+            ud.conn
+                .execute(
+                    "INSERT INTO PlaylistItemMarkerParagraphMap VALUES (?1, 1102021, 3, 0)",
+                    [marker],
+                )
+                .unwrap();
+            tag
+        }
+
+        /// Item, media, location map and thumbnail columns of every item of
+        /// `tag`, by position.
+        fn item_rows(ud: &UserData, tag: i64) -> Vec<Vec<rusqlite::types::Value>> {
+            let mut stmt = ud
+                .conn
+                .prepare(
+                    "SELECT i.Label, i.Accuracy, i.EndAction, i.StartTrimOffsetTicks,
+                            i.EndTrimOffsetTicks, m.MimeType, m.OriginalFilename, m.Hash,
+                            im.DurationTicks, lm.BaseDurationTicks, lm.MajorMultimediaType,
+                            th.MimeType, th.OriginalFilename, th.Hash
+                     FROM TagMap t JOIN PlaylistItem i ON i.PlaylistItemId = t.PlaylistItemId
+                     LEFT JOIN PlaylistItemIndependentMediaMap im
+                         ON im.PlaylistItemId = i.PlaylistItemId
+                     LEFT JOIN IndependentMedia m ON m.IndependentMediaId = im.IndependentMediaId
+                     LEFT JOIN PlaylistItemLocationMap lm ON lm.PlaylistItemId = i.PlaylistItemId
+                     LEFT JOIN IndependentMedia th ON th.FilePath = i.ThumbnailFilePath
+                     WHERE t.TagId = ?1 ORDER BY t.Position",
+                )
+                .unwrap();
+            stmt.query_map([tag], |r| (0..14).map(|i| r.get(i)).collect())
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        }
+
+        /// A playlist file holding `ud`'s database and the zip entries `files`.
+        fn playlist_file(ud: &UserData, dest: &Path, files: &[(&str, &[u8])]) {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join(DB_NAME);
+            ud.conn
+                .execute("VACUUM INTO ?1", [db.to_string_lossy().as_ref()])
+                .unwrap();
+            let mut zip = zip::ZipWriter::new(File::create(dest).unwrap());
+            let options = SimpleFileOptions::default();
+            zip.start_file(MANIFEST, options).unwrap();
+            zip.write_all(
+                br#"{"creationDate":"x","version":1,"name":"x.jwlplaylist","type":1,
+                    "userDataBackup":{"lastModifiedDate":"x","hash":"x",
+                    "databaseName":"userData.db","deviceName":"iPhone","schemaVersion":16}}"#,
+            )
+            .unwrap();
+            zip.start_file(DB_NAME, options).unwrap();
+            zip.write_all(&fs::read(&db).unwrap()).unwrap();
+            for (name, bytes) in files {
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+
+        #[test]
+        fn export_import_round_trip() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            let tag = sample_playlist(&mut source, "Songs");
+            let file = tmp.path().join("Songs.jwlplaylist");
+            source.export_playlist(tag, &file).unwrap();
+
+            let mut ud = open(&tmp.path().join("b"));
+            let id = ud.import_playlist(&file).unwrap();
+            assert_eq!(ud.playlist(id).unwrap().name, "Songs");
+            let expected = crate::playlist::content(&source.conn, "main", tag).unwrap();
+            assert_eq!(expected.len(), 4);
+            assert_eq!(expected[3].markers.len(), 1);
+            assert_eq!(
+                crate::playlist::content(&ud.conn, "main", id).unwrap(),
+                expected
+            );
+            assert_eq!(item_rows(&ud, id), item_rows(&source, tag));
+            let names = [PHOTO, MOV].into_iter().chain(THUMBS);
+            for name in names {
+                assert_eq!(
+                    fs::read(ud.playlist_media_dir().join(name)).unwrap(),
+                    fs::read(source.playlist_media_dir().join(name)).unwrap(),
+                    "{name}"
+                );
+            }
+            let items = ud.playlist(id).unwrap().items;
+            assert!(items.iter().all(|i| i.thumbnail.is_some()));
+            assert!(items.iter().all(|i| match &i.source {
+                ItemSource::File { available, .. } => *available,
+                ItemSource::Library { .. } => true,
+            }));
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn export_is_a_valid_jw_library_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            let tag = sample_playlist(&mut source, "Songs");
+            let file = tmp.path().join("Songs.jwlplaylist");
+            source.export_playlist(tag, &file).unwrap();
+            assert!(!tmp.path().join("Songs.jwlplaylist.part").exists());
+
+            let mut zip = ZipArchive::new(File::open(&file).unwrap()).unwrap();
+            let manifest: serde_json::Value = {
+                let mut buf = Vec::new();
+                zip.by_name(MANIFEST)
+                    .unwrap()
+                    .read_to_end(&mut buf)
+                    .unwrap();
+                serde_json::from_slice(&buf).unwrap()
+            };
+            let mut db_bytes = Vec::new();
+            zip.by_name(DB_NAME)
+                .unwrap()
+                .read_to_end(&mut db_bytes)
+                .unwrap();
+            assert_eq!(manifest["type"], 1);
+            assert_eq!(manifest["name"], "Songs.jwlplaylist");
+            let info = &manifest["userDataBackup"];
+            assert_eq!(info["hash"], hex::encode(Sha256::digest(&db_bytes)));
+            assert_eq!(info["deviceName"], DEVICE_NAME);
+            assert_eq!(info["databaseName"], DB_NAME);
+            assert_eq!(info["schemaVersion"], 16);
+            assert!(zip.by_name(THUMBNAIL).is_ok());
+            for name in [PHOTO, MOV].into_iter().chain(THUMBS) {
+                let entry = zip.by_name(name).unwrap();
+                assert_eq!(
+                    entry.compression(),
+                    zip::CompressionMethod::Stored,
+                    "{name}"
+                );
+            }
+
+            let db = tmp.path().join("exported.db");
+            fs::write(&db, &db_bytes).unwrap();
+            check_database(&db).unwrap();
+            let conn = Connection::open(&db).unwrap();
+            let version: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 16);
+            let tables: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE name LIKE 'ReadingPlan%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(tables, 0);
+            let tags: Vec<(i64, i64, String)> = conn
+                .prepare("SELECT TagId, Type, Name FROM Tag")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(tags, [(1, 2, "Songs".to_owned())]);
+            let map: Vec<(i64, i64)> = conn
+                .prepare("SELECT PlaylistItemId, Position FROM TagMap ORDER BY Position")
+                .unwrap()
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(map, [(1, 0), (2, 1), (3, 2), (4, 3)]);
+            let media: i64 = conn
+                .query_row("SELECT count(*) FROM IndependentMedia", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(media, 6);
+            let mut fk = conn.prepare("PRAGMA foreign_key_check").unwrap();
+            assert!(fk.query([]).unwrap().next().unwrap().is_none());
+        }
+
+        #[test]
+        fn import_name_clash() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            let tag = sample_playlist(&mut source, "Songs");
+            let file = tmp.path().join("Songs.jwlplaylist");
+            source.export_playlist(tag, &file).unwrap();
+
+            let mut ud = open(&tmp.path().join("b"));
+            ud.create_playlist("Songs").unwrap();
+            let second = ud.import_playlist(&file).unwrap();
+            assert_eq!(ud.playlist(second).unwrap().name, "Songs (2)");
+            let third = ud.import_playlist(&file).unwrap();
+            assert_eq!(ud.playlist(third).unwrap().name, "Songs (3)");
+            assert_eq!(ud.playlist(third).unwrap().items.len(), 4);
+            // The files are shared by FilePath.
+            assert_eq!(count(&ud, "IndependentMedia"), 6);
+            assert_eq!(count(&ud, "Location"), 2);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn import_rejects_non_playlists() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            source
+                .save_note(Some(&bible(3)), None, &note_input("T", "C", &["Mut"]))
+                .unwrap();
+            let backup = backup_of(&source, tmp.path(), "plain.jwlibrary");
+            sample_playlist(&mut source, "Songs");
+            source.create_playlist("Videos").unwrap();
+            let two = tmp.path().join("two.jwlplaylist");
+            playlist_file(&source, &two, &[]);
+
+            let mut ud = open(&tmp.path().join("b"));
+            let before = ud.fingerprint().unwrap();
+            assert!(is_invalid(ud.import_playlist(&backup)));
+            assert!(is_invalid(ud.import_playlist(&two)));
+            assert_eq!(ud.fingerprint().unwrap(), before);
+            assert!(!ud.playlist_media_dir().exists());
+        }
+
+        #[test]
+        fn import_skips_unsafe_paths() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            let tag = source.create_playlist("Evil").unwrap();
+            source
+                .add_library_item(tag, &song("sjjm", ItemKind::Audio), "Song", 1)
+                .unwrap();
+            let evil = media(&source, "../evil.png", "image/png");
+            file_item(&source, tag, 1, evil, None);
+            let png = media(&source, PHOTO, "image/png");
+            media(&source, "../thumb.jpeg", "image/jpeg");
+            let kept = file_item(&source, tag, 2, png, Some("../thumb.jpeg"));
+            let file = tmp.path().join("evil.jwlplaylist");
+            playlist_file(
+                &source,
+                &file,
+                &[
+                    ("../evil.png", b"evil"),
+                    ("../thumb.jpeg", b"evil"),
+                    (PHOTO, b"png"),
+                ],
+            );
+            assert!(kept > 0);
+
+            let mut ud = open(&tmp.path().join("b"));
+            let id = ud.import_playlist(&file).unwrap();
+            let items = ud.playlist(id).unwrap().items;
+            assert_eq!(items.len(), 2);
+            assert!(matches!(items[0].source, ItemSource::Library { .. }));
+            let ItemSource::File {
+                path, available, ..
+            } = &items[1].source
+            else {
+                panic!("not a file item");
+            };
+            assert_eq!(path, &ud.playlist_media_dir().join(PHOTO));
+            assert!(*available);
+            let thumbs: i64 = ud
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM PlaylistItem WHERE ThumbnailFilePath IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(thumbs, 0);
+            let unsafe_rows: i64 = ud
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM IndependentMedia WHERE FilePath LIKE '../%'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(unsafe_rows, 0);
+            assert!(!tmp.path().join("b").join("evil.png").exists());
+            assert!(!tmp.path().join("b").join("thumb.jpeg").exists());
+            assert!(!tmp.path().join("evil.png").exists());
+            assert_eq!(
+                fs::read_dir(ud.playlist_media_dir()).unwrap().count(),
+                1,
+                "only the photo"
+            );
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn import_tolerates_missing_media() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            let tag = source.create_playlist("Fotos").unwrap();
+            let png = stored_media(&source, PHOTO, PHOTO, "image/png", b"png");
+            let photo = item(&source, tag, 0, "IMG_3019.png", None);
+            map_media(&source, photo, png, 40_000_000);
+            fs::remove_file(source.playlist_media_dir().join(PHOTO)).unwrap();
+            let file = tmp.path().join("Fotos.jwlplaylist");
+            source.export_playlist(tag, &file).unwrap();
+
+            let mut ud = open(&tmp.path().join("b"));
+            let id = ud.import_playlist(&file).unwrap();
+            let items = ud.playlist(id).unwrap().items;
+            assert_eq!(items.len(), 1);
+            assert!(matches!(
+                items[0].source,
+                ItemSource::File {
+                    available: false,
+                    ..
+                }
+            ));
+            assert_eq!(count(&ud, "IndependentMedia"), 1);
+            assert_eq!(ud.install_missing_media(&file).unwrap(), [PHOTO]);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn import_skips_items_without_a_source() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            let tag = source.create_playlist("Mixed").unwrap();
+            library_item(&source, tag, 0, 1, 2);
+            // No media and no location at all.
+            item(&source, tag, 1, "Empty", None);
+            // A location that is not in the file.
+            let dangling = item(&source, tag, 2, "Dangling", None);
+            source
+                .conn
+                .execute_batch(&format!(
+                    "PRAGMA foreign_keys = OFF;
+                     INSERT INTO PlaylistItemLocationMap
+                         (PlaylistItemId, LocationId, MajorMultimediaType, BaseDurationTicks)
+                         VALUES ({dangling}, 999, 0, 1);"
+                ))
+                .unwrap();
+            let file = tmp.path().join("mixed.jwlplaylist");
+            playlist_file(&source, &file, &[]);
+
+            let mut ud = open(&tmp.path().join("b"));
+            let id = ud.import_playlist(&file).unwrap();
+            assert_eq!(labels(&ud, id), ["Song"]);
+            assert_eq!(count(&ud, "PlaylistItem"), 1);
+            assert_eq!(count(&ud, "TagMap"), 1);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn import_rejects_missing_playlist_tables() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            source.create_playlist("Songs").unwrap();
+            source
+                .conn
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     DROP TABLE PlaylistItemMarkerParagraphMap;
+                     DROP TABLE PlaylistItemMarkerBibleVerseMap;
+                     DROP TABLE PlaylistItemMarker;
+                     DROP TABLE PlaylistItemLocationMap;
+                     DROP TABLE PlaylistItemIndependentMediaMap;
+                     DROP TABLE PlaylistItem;
+                     DROP TABLE PlaylistItemAccuracy;
+                     DROP TABLE IndependentMedia;
+                     PRAGMA foreign_keys = ON;",
+                )
+                .unwrap();
+            let file = tmp.path().join("bare.jwlplaylist");
+            playlist_file(&source, &file, &[]);
+
+            let mut ud = open(&tmp.path().join("b"));
+            let before = ud.fingerprint().unwrap();
+            let result = ud.import_playlist(&file);
+            assert!(
+                matches!(&result, Err(Error::Invalid(m)) if m.contains("missing table")),
+                "{result:?}"
+            );
+            assert_eq!(ud.fingerprint().unwrap(), before);
+            assert!(ud.playlists().unwrap().is_empty());
+            assert!(!ud.playlist_media_dir().exists());
+        }
+
+        #[test]
+        fn import_cleans_crafted_values() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            source
+                .conn
+                .execute_batch("PRAGMA foreign_keys = OFF;")
+                .unwrap();
+            let tag = source.create_playlist("Crafted").unwrap();
+            let png = media(&source, PHOTO, "image/png");
+            let blank = file_item(&source, tag, 0, png, None);
+            let odd = file_item(&source, tag, 1, png, None);
+            source
+                .conn
+                .execute_batch(&format!(
+                    "UPDATE PlaylistItem SET Label = '  ' WHERE PlaylistItemId = {blank};
+                     UPDATE PlaylistItem SET EndAction = 9, Accuracy = 7,
+                         StartTrimOffsetTicks = -5, EndTrimOffsetTicks = 'junk'
+                         WHERE PlaylistItemId = {odd};
+                     UPDATE PlaylistItemIndependentMediaMap SET DurationTicks = -1
+                         WHERE PlaylistItemId = {odd};
+                     INSERT INTO PlaylistItemMarker (PlaylistItemId, Label, StartTimeTicks,
+                         DurationTicks, EndTransitionDurationTicks)
+                         VALUES ({odd}, 'ok', 0, 10, 0), ({odd}, 'neg', -3, 10, 0),
+                                ({odd}, ' ', 20, 10, 0), ({odd}, 'dur', 40, -1, 0);"
+                ))
+                .unwrap();
+            let file = tmp.path().join("crafted.jwlplaylist");
+            playlist_file(&source, &file, &[(PHOTO, b"png")]);
+
+            let mut ud = open(&tmp.path().join("b"));
+            let id = ud.import_playlist(&file).unwrap();
+            let items = ud.playlist(id).unwrap().items;
+            assert_eq!(items.len(), 1, "the blank-label item is skipped");
+            let row = item_row(&ud, items[0].id);
+            assert_eq!(row, ("photo.png".to_owned(), 2, 0, None, None));
+            let ticks: i64 = ud
+                .conn
+                .query_row(
+                    "SELECT DurationTicks FROM PlaylistItemIndependentMediaMap
+                     WHERE PlaylistItemId = ?1",
+                    [items[0].id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(ticks, 0);
+            let markers: Vec<String> = ud
+                .conn
+                .prepare("SELECT Label FROM PlaylistItemMarker")
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(markers, ["ok"]);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        /// A playlist in `ud` with one photo item holding `bytes`; returns
+        /// the item id and the photo's `FilePath`.
+        fn photo_item(ud: &mut UserData, bytes: &[u8]) -> (i64, String) {
+            let tag = ud.create_playlist("Fotos").unwrap();
+            let src = tempfile::tempdir().unwrap();
+            let png = src.path().join("IMG_3019.png");
+            fs::write(&png, bytes).unwrap();
+            let item = ud.add_file_item(tag, &png).unwrap();
+            let name = ud
+                .conn
+                .query_row("SELECT FilePath FROM IndependentMedia", [], |r| r.get(0))
+                .unwrap();
+            (item, name)
+        }
+
+        fn file_available(ud: &UserData) -> bool {
+            let tag = ud.playlists().unwrap()[0].id;
+            match &ud.playlist(tag).unwrap().items[0].source {
+                ItemSource::File { available, .. } => *available,
+                ItemSource::Library { .. } => panic!("not a file item"),
+            }
+        }
+
+        fn zip_names(path: &Path) -> Vec<String> {
+            let mut zip = ZipArchive::new(File::open(path).unwrap()).unwrap();
+            let mut names: Vec<String> = (0..zip.len())
+                .map(|i| zip.by_index(i).unwrap().name().unwrap().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[test]
+        fn backup_carries_media() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            let (item, photo) = photo_item(&mut source, b"\x89PNG photo");
+            source
+                .set_playlist_item_thumbnail(item, b"jpeg thumb")
+                .unwrap();
+            let thumb = thumbnail_of(&source, item).unwrap();
+            let backup = tmp.path().join("b.jwlibrary");
+            source.export_backup(&backup).unwrap();
+
+            let mut zip = ZipArchive::new(File::open(&backup).unwrap()).unwrap();
+            for (name, bytes) in [(&photo, &b"\x89PNG photo"[..]), (&thumb, b"jpeg thumb")] {
+                let mut entry = zip.by_name(name).unwrap();
+                assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).unwrap();
+                assert_eq!(buf, bytes, "{name}");
+            }
+
+            let mut ud = open(&tmp.path().join("c"));
+            ud.restore_backup(&backup).unwrap();
+            assert!(file_available(&ud));
+            let tag = ud.playlists().unwrap()[0].id;
+            assert_eq!(
+                ud.playlist(tag).unwrap().items[0].thumbnail,
+                Some(ud.playlist_media_dir().join(&thumb))
+            );
+            assert_eq!(
+                fs::read(ud.playlist_media_dir().join(&photo)).unwrap(),
+                b"\x89PNG photo"
+            );
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn backup_skips_missing_media() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            let (_, photo) = photo_item(&mut source, b"png");
+            fs::remove_file(source.playlist_media_dir().join(&photo)).unwrap();
+            let backup = tmp.path().join("b.jwlibrary");
+            source.export_backup(&backup).unwrap();
+            assert_eq!(zip_names(&backup), [THUMBNAIL, MANIFEST, DB_NAME]);
+        }
+
+        #[test]
+        fn restore_replaces_media() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut other = open(&tmp.path().join("b"));
+            let (_, y) = photo_item(&mut other, b"photo Y");
+            let backup = tmp.path().join("b.jwlibrary");
+            other.export_backup(&backup).unwrap();
+
+            let mut ud = open(&tmp.path().join("a"));
+            let (_, x) = photo_item(&mut ud, b"photo X");
+            let dir = ud.playlist_media_dir();
+            let z = "0F4D0C55-6E4B-4E39-9C0B-5E0D1A3B2C1D.png";
+            fs::write(dir.join(z), b"stray").unwrap();
+            ud.restore_backup(&backup).unwrap();
+            assert_eq!(fs::read(dir.join(&y)).unwrap(), b"photo Y");
+            assert!(!dir.join(&x).exists());
+            assert_eq!(fs::read(dir.join(z)).unwrap(), b"stray");
+            assert!(file_available(&ud));
+        }
+
+        #[test]
+        fn restore_keeps_old_media_on_failure() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(&tmp.path().join("a"));
+            let (_, x) = photo_item(&mut ud, b"photo X");
+            let bad = tmp.path().join("bad.jwlibrary");
+            // A valid SQLite file without the user data tables.
+            let db = tmp.path().join("bad.db");
+            Connection::open(&db)
+                .unwrap()
+                .execute_batch("CREATE TABLE Other (x)")
+                .unwrap();
+            assert!(check_database(&db).is_err());
+            {
+                let mut zip = zip::ZipWriter::new(File::create(&bad).unwrap());
+                zip.start_file(MANIFEST, SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(
+                    br#"{"creationDate":"x","version":1,"name":"x","type":0,"userDataBackup":
+                        {"lastModifiedDate":"x","hash":"x","databaseName":"userData.db",
+                         "deviceName":"x","schemaVersion":16}}"#,
+                )
+                .unwrap();
+                zip.start_file(DB_NAME, SimpleFileOptions::default())
+                    .unwrap();
+                zip.write_all(&fs::read(&db).unwrap()).unwrap();
+                zip.start_file(&x, SimpleFileOptions::default()).unwrap();
+                zip.write_all(b"replaced").unwrap();
+                zip.finish().unwrap();
+            }
+            assert!(matches!(
+                ud.restore_backup(&bad),
+                Err(Error::InvalidDatabase { .. })
+            ));
+            assert_eq!(
+                fs::read(ud.playlist_media_dir().join(&x)).unwrap(),
+                b"photo X"
+            );
+            assert!(file_available(&ud));
+        }
+
+        #[test]
+        fn backup_without_media_flag() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut source = open(&tmp.path().join("a"));
+            photo_item(&mut source, b"png");
+            let backup = tmp.path().join("b.jwlibrary");
+            source
+                .export_backup_with(&backup, DEVICE_NAME, false)
+                .unwrap();
+            assert_eq!(zip_names(&backup), [THUMBNAIL, MANIFEST, DB_NAME]);
+
+            let mut ud = open(&tmp.path().join("c"));
+            ud.restore_backup(&backup).unwrap();
+            assert!(!file_available(&ud));
+            assert_foreign_keys_hold(&ud);
+        }
+
+        /// Append the own file `name` holding `bytes` to `tag`; returns the
+        /// item and its `FilePath`.
+        pub(super) fn own_file(
+            ud: &mut UserData,
+            tag: i64,
+            name: &str,
+            bytes: &[u8],
+        ) -> (i64, String) {
+            let src = tempfile::tempdir().unwrap();
+            let file = src.path().join(name);
+            fs::write(&file, bytes).unwrap();
+            let item = ud.add_file_item(tag, &file).unwrap();
+            let path = media_of(ud, item).1;
+            (item, path)
+        }
+
+        pub(super) fn song_track(track: i64) -> LibraryRef {
+            LibraryRef {
+                track,
+                ..song("sjjm", ItemKind::Audio)
+            }
+        }
+
+        pub(super) fn labels(ud: &UserData, tag: i64) -> Vec<String> {
+            ud.playlist(tag)
+                .unwrap()
+                .items
+                .into_iter()
+                .map(|i| i.label)
+                .collect()
+        }
+
+        pub(super) fn playlist_id(ud: &UserData, name: &str) -> i64 {
+            ud.playlists()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == name)
+                .unwrap_or_else(|| panic!("no playlist {name}"))
+                .id
+        }
+
+        /// Local "Songs" = [Song A, own video V.mov] at `local_time`, and a
+        /// backup whose "Songs" = [Song B] at `remote_time`. Returns the
+        /// local playlist, V's item and `FilePath`, and the backup.
+        fn songs_on_both(
+            tmp: &Path,
+            local_time: &str,
+            remote_time: &str,
+        ) -> (UserData, i64, i64, String, PathBuf) {
+            let mut ud = open(&tmp.join("a"));
+            let tag = ud.create_playlist("Songs").unwrap();
+            ud.add_library_item(tag, &song_track(1), "Song A", 10)
+                .unwrap();
+            let (video, path) = own_file(&mut ud, tag, "V.mov", b"own video");
+            set_db_time(&ud, local_time);
+            let mut remote = open(&tmp.join("b"));
+            let other = remote.create_playlist("Songs").unwrap();
+            remote
+                .add_library_item(other, &song_track(2), "Song B", 10)
+                .unwrap();
+            set_db_time(&remote, remote_time);
+            let backup = backup_of(&remote, tmp, "b.jwlibrary");
+            (ud, tag, video, path, backup)
+        }
+
+        #[test]
+        fn merge_adds_missing_playlist_with_media() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut remote = open(&tmp.path().join("b"));
+            let tag = remote.create_playlist("Songs").unwrap();
+            let (_, photo) = own_file(&mut remote, tag, "IMG_3019.png", b"\x89PNG photo");
+            let backup = backup_of(&remote, tmp.path(), "b.jwlibrary");
+
+            let mut ud = open(&tmp.path().join("a"));
+            let report = ud.merge_backup(&backup).unwrap();
+            assert_eq!((report.added, report.updated), (1, 0));
+            assert!(report.conflicts.is_empty());
+            let id = playlist_id(&ud, "Songs");
+            assert_eq!(labels(&ud, id), ["IMG_3019.png"]);
+            assert!(file_available(&ud));
+            assert_eq!(
+                fs::read(ud.playlist_media_dir().join(&photo)).unwrap(),
+                b"\x89PNG photo"
+            );
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn merge_same_is_unchanged() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut remote = open(&tmp.path().join("b"));
+            let tag = remote.create_playlist("Songs").unwrap();
+            remote
+                .add_library_item(tag, &song_track(1), "Song A", 10)
+                .unwrap();
+            own_file(&mut remote, tag, "IMG_3019.png", b"png");
+            let backup = backup_of(&remote, tmp.path(), "b.jwlibrary");
+
+            let mut ud = open(&tmp.path().join("a"));
+            ud.restore_backup(&backup).unwrap();
+            let before = ud.playlists().unwrap();
+            let fingerprint = ud.fingerprint().unwrap();
+            let report = ud.merge_backup(&backup).unwrap();
+            assert_eq!((report.added, report.updated), (0, 0));
+            assert!(report.unchanged >= 1);
+            assert!(report.conflicts.is_empty());
+            assert_eq!(ud.playlists().unwrap(), before);
+            assert_eq!(ud.fingerprint().unwrap(), fingerprint);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn merge_newer_replaces_but_keeps_own_files() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut ud, tag, video, path, backup) =
+                songs_on_both(tmp.path(), "2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z");
+            let media: i64 = ud
+                .conn
+                .query_row(
+                    "SELECT IndependentMediaId FROM IndependentMedia WHERE FilePath = ?1",
+                    [&path],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let report = ud.merge_backup(&backup).unwrap();
+            assert_eq!((report.added, report.updated), (0, 1));
+            assert!(report.conflicts.is_empty());
+            assert_eq!(playlist_id(&ud, "Songs"), tag);
+            assert_eq!(labels(&ud, tag), ["Song B", "V.mov"]);
+            assert_eq!(
+                positions(&ud, tag).iter().map(|p| p.1).collect::<Vec<_>>(),
+                [0, 1]
+            );
+            let kept = *item_ids(&ud, tag).last().unwrap();
+            assert_ne!(kept, video);
+            let (_, kept_path, mime, hash, ticks) = media_of(&ud, kept);
+            assert_eq!(
+                (kept_path, mime, hash, ticks),
+                (
+                    path.clone(),
+                    "video/quicktime".into(),
+                    ios_hash(&Sha256::digest(b"own video")),
+                    0
+                )
+            );
+            assert_eq!(count(&ud, "IndependentMedia"), 1);
+            let still: i64 = ud
+                .conn
+                .query_row("SELECT IndependentMediaId FROM IndependentMedia", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(still, media);
+            assert_eq!(
+                fs::read(ud.playlist_media_dir().join(&path)).unwrap(),
+                b"own video"
+            );
+            assert_eq!(count(&ud, "PlaylistItem"), 2);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn merge_twice_after_keep_is_unchanged() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut ud, tag, _, _, backup) =
+                songs_on_both(tmp.path(), "2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z");
+            let first = ud.merge_backup(&backup).unwrap();
+            assert_eq!(first.updated, 1);
+            assert_eq!(labels(&ud, tag), ["Song B", "V.mov"]);
+            let before = ud.playlist(tag).unwrap();
+
+            let again = ud.merge_backup(&backup).unwrap();
+            assert!(again.conflicts.is_empty(), "{:?}", again.conflicts);
+            assert_eq!((again.added, again.updated), (0, 0));
+            assert!(again.unchanged > first.unchanged);
+            assert_eq!(labels(&ud, tag), ["Song B", "V.mov"]);
+            assert_eq!(ud.playlist(tag).unwrap(), before);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn merge_keeps_own_file_with_thumbnail_and_marker() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut ud, tag, video, path, backup) =
+                songs_on_both(tmp.path(), "2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z");
+            ud.set_playlist_item_thumbnail(video, b"thumb jpeg")
+                .unwrap();
+            let thumb = thumbnail_of(&ud, video).unwrap();
+            ud.conn
+                .execute(
+                    "INSERT INTO PlaylistItemMarker (PlaylistItemId, Label, StartTimeTicks,
+                         DurationTicks, EndTransitionDurationTicks)
+                     VALUES (?1, 'Intro', 0, 50000000, 0)",
+                    [video],
+                )
+                .unwrap();
+            let marker = ud.conn.last_insert_rowid();
+            ud.conn
+                .execute(
+                    "INSERT INTO PlaylistItemMarkerBibleVerseMap VALUES (?1, 40001001)",
+                    [marker],
+                )
+                .unwrap();
+            ud.conn
+                .execute(
+                    "INSERT INTO PlaylistItemMarkerParagraphMap VALUES (?1, 1102021, 3, 0)",
+                    [marker],
+                )
+                .unwrap();
+            set_db_time(&ud, "2026-01-01T00:00:00Z");
+            let old = crate::playlist::content(&ud.conn, "main", tag).unwrap();
+            let old_video = old.last().unwrap().clone();
+
+            let report = ud.merge_backup(&backup).unwrap();
+            assert_eq!(report.updated, 1);
+            assert_eq!(labels(&ud, tag), ["Song B", "V.mov"]);
+            let kept = *item_ids(&ud, tag).last().unwrap();
+            assert_ne!(kept, video);
+            assert_eq!(thumbnail_of(&ud, kept), Some(thumb.clone()));
+            let now = crate::playlist::content(&ud.conn, "main", tag).unwrap();
+            assert_eq!(now.last().unwrap(), &old_video);
+            assert_eq!(old_video.markers.len(), 1);
+            assert_eq!(old_video.markers[0].verses, [40001001]);
+            assert_eq!(old_video.markers[0].paragraphs, [(1102021, 3, 0)]);
+            assert_eq!(count(&ud, "PlaylistItemMarker"), 1);
+            assert_eq!(count(&ud, "IndependentMedia"), 2);
+            let dir = ud.playlist_media_dir();
+            assert_eq!(fs::read(dir.join(&thumb)).unwrap(), b"thumb jpeg");
+            assert_eq!(fs::read(dir.join(&path)).unwrap(), b"own video");
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn merge_older_reports_conflict() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut ud, tag, _, _, backup) =
+                songs_on_both(tmp.path(), "2026-06-01T00:00:00Z", "2026-01-01T00:00:00Z");
+            let before = ud.playlist(tag).unwrap();
+            let report = ud.merge_backup(&backup).unwrap();
+            assert_eq!((report.added, report.updated), (0, 0));
+            assert_eq!(
+                report.conflicts,
+                [conflict("Playlist", "Songs", "Playlist Songs".into())]
+            );
+            assert_eq!(ud.playlist(tag).unwrap(), before);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn merge_shared_media_by_filepath() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(&tmp.path().join("a"));
+            let tag = ud.create_playlist("Songs").unwrap();
+            let (_, photo) = own_file(&mut ud, tag, "IMG_3019.png", b"png");
+            let mut remote = open(&tmp.path().join("b"));
+            remote
+                .restore_backup(&backup_of(&ud, tmp.path(), "a.jwlibrary"))
+                .unwrap();
+            remote.rename_playlist(tag, "Other").unwrap();
+            let backup = backup_of(&remote, tmp.path(), "b.jwlibrary");
+
+            let report = ud.merge_backup(&backup).unwrap();
+            assert_eq!(report.added, 1);
+            let other = playlist_id(&ud, "Other");
+            assert_eq!(count(&ud, "IndependentMedia"), 1);
+            let first = item_ids(&ud, tag)[0];
+            let second = item_ids(&ud, other)[0];
+            assert_eq!(media_of(&ud, first).1, photo);
+            assert_eq!(media_of(&ud, second).1, photo);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        #[test]
+        fn merge_backup_without_playlist_tables() {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut ud = open(&tmp.path().join("a"));
+            let tag = ud.create_playlist("Songs").unwrap();
+            ud.add_library_item(tag, &song_track(1), "Song A", 10)
+                .unwrap();
+            let remote = open(&tmp.path().join("b"));
+            remote
+                .conn
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     INSERT INTO Tag (Type, Name) VALUES (2, 'Songs');
+                     DROP TABLE PlaylistItemMarkerParagraphMap;
+                     DROP TABLE PlaylistItemMarkerBibleVerseMap;
+                     DROP TABLE PlaylistItemMarker;
+                     DROP TABLE PlaylistItemLocationMap;
+                     DROP TABLE PlaylistItemIndependentMediaMap;
+                     DROP TABLE PlaylistItem;
+                     DROP TABLE PlaylistItemAccuracy;
+                     DROP TABLE IndependentMedia;
+                     PRAGMA foreign_keys = ON;",
+                )
+                .unwrap();
+            set_db_time(&remote, "2099-01-01T00:00:00Z");
+            let backup = backup_of(&remote, tmp.path(), "b.jwlibrary");
+            let before = ud.playlists().unwrap();
+            let items = ud.playlist(tag).unwrap();
+            let report = ud.merge_backup(&backup).unwrap();
+            assert_eq!((report.added, report.updated), (0, 0));
+            assert!(report.conflicts.is_empty());
+            assert_eq!(ud.playlists().unwrap(), before);
+            assert_eq!(ud.playlist(tag).unwrap(), items);
+            assert_foreign_keys_hold(&ud);
+        }
+
+        /// A sync merge of `backup` with no plan for any row.
+        fn merge_as_sync(ud: &mut UserData, backup: &Path) -> (MergeReport, Vec<String>) {
+            let (incoming, device) = ud.unpack_incoming(backup).unwrap();
+            let rows = rows_of_file(incoming.path()).unwrap();
+            let resolver = Resolver::new(&rows, rows_of(&ud.conn).unwrap(), Default::default());
+            let (report, _, orphans) = ud
+                .merge_file(incoming.path(), device, Some(&resolver))
+                .unwrap();
+            (report, orphans)
+        }
+
+        #[test]
+        fn sync_replace_keeps_no_own_files() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut ud, tag, _, path, backup) =
+                songs_on_both(tmp.path(), "2026-01-01T00:00:00Z", "2026-06-01T00:00:00Z");
+            let (report, orphans) = merge_as_sync(&mut ud, &backup);
+            assert_eq!(report.updated, 1);
+            assert_eq!(labels(&ud, tag), ["Song B"]);
+            assert_eq!(orphans, [path]);
+            assert_eq!(count(&ud, "IndependentMedia"), 0);
+            assert_foreign_keys_hold(&ud);
+        }
+    }
+
     /// Folder sync: two devices A and B, each merging the other's file
     /// three-way against the base it stored for that device.
     mod sync_merge {
@@ -7232,6 +10677,174 @@ mod tests {
                 assert_eq!(mark_color(&a.ud, m), Some(4));
             }
             assert_eq!(a.ud.snapshot().unwrap(), r.snapshot);
+        }
+
+        use super::playlists::{labels, media_of, own_file, playlist_id, song_track};
+
+        fn has_playlist(ud: &UserData, name: &str) -> bool {
+            ud.playlists().unwrap().iter().any(|p| p.name == name)
+        }
+
+        #[test]
+        fn sync_takes_one_sided_change_exactly() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let tag = a.ud.create_playlist("Songs").unwrap();
+            a.ud.add_library_item(tag, &song_track(1), "Song", 10)
+                .unwrap();
+            let (_, path) = own_file(&mut a.ud, tag, "V.mov", b"own video");
+            sync_both(&mut a, &mut b);
+            let there = playlist_id(&b.ud, "Songs");
+            assert_eq!(labels(&b.ud, there), ["Song", "V.mov"]);
+            // B removes V; A takes that as it is, without keeping V as an
+            // own file the way a manual merge would.
+            let video = b.ud.playlist(there).unwrap().items[1].id;
+            b.ud.remove_playlist_item(video).unwrap();
+            // A is the newer database: the manual merge would keep its
+            // version and list B's as a conflict.
+            set_db_time(&b.ud, "2026-01-01T10:00:00Z");
+            set_db_time(&a.ud, "2026-06-01T10:00:00Z");
+            let r = sync(&b, &mut a);
+            assert_eq!(r.report.updated, 1);
+            assert!(r.report.conflicts.is_empty(), "{:?}", r.report.conflicts);
+            assert_eq!(labels(&a.ud, tag), ["Song"]);
+            assert_eq!(count(&a.ud, "IndependentMedia"), 0);
+            assert!(!a.ud.playlist_media_dir().join(&path).exists());
+            assert_eq!(a.ud.snapshot().unwrap(), r.snapshot);
+            assert_foreign_keys_hold(&a.ud);
+        }
+
+        #[test]
+        fn sync_one_sided_delete() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let songs = a.ud.create_playlist("Songs").unwrap();
+            a.ud.add_library_item(songs, &song_track(1), "Song", 10)
+                .unwrap();
+            let (_, path) = own_file(&mut a.ud, songs, "V.mov", b"own video");
+            let videos = a.ud.create_playlist("Videos").unwrap();
+            sync_both(&mut a, &mut b);
+
+            // Deleted there: deleted here, with its items and media file.
+            let there = playlist_id(&b.ud, "Songs");
+            b.ud.delete_playlist(there).unwrap();
+            let r = sync(&b, &mut a);
+            assert_eq!(r.deleted, 1);
+            assert!(r.report.conflicts.is_empty(), "{:?}", r.report.conflicts);
+            assert!(!has_playlist(&a.ud, "Songs"));
+            assert!(has_playlist(&a.ud, "Videos"));
+            assert_eq!(count(&a.ud, "PlaylistItem"), 0);
+            assert_eq!(count(&a.ud, "IndependentMedia"), 0);
+            assert!(!a.ud.playlist_media_dir().join(&path).exists());
+            assert_foreign_keys_hold(&a.ud);
+
+            // Edited here and deleted there: kept and reported.
+            a.ud.add_library_item(videos, &song_track(2), "Video", 10)
+                .unwrap();
+            let there = playlist_id(&b.ud, "Videos");
+            b.ud.delete_playlist(there).unwrap();
+            let r = sync(&b, &mut a);
+            assert_eq!(r.deleted, 0);
+            assert_eq!(labels(&a.ud, videos), ["Video"]);
+            assert_eq!(
+                r.report.conflicts,
+                [Conflict {
+                    table: "Playlist".into(),
+                    guid: "Videos".into(),
+                    summary: "Playlist Videos".into(),
+                }]
+            );
+        }
+
+        #[test]
+        fn sync_two_sided_change_converges() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let here = a.ud.create_playlist("Songs").unwrap();
+            a.ud.add_library_item(here, &song_track(1), "Song 1", 10)
+                .unwrap();
+            sync_both(&mut a, &mut b);
+            let there = playlist_id(&b.ud, "Songs");
+            a.ud.add_library_item(here, &song_track(2), "Song 2", 10)
+                .unwrap();
+            b.ud.add_library_item(there, &song_track(3), "Song 3", 10)
+                .unwrap();
+            let key = crate::sync_snapshot::RowKey::Playlist("Songs".into());
+            let hash = |ud: &UserData| ud.snapshot().unwrap().0[&key].clone();
+            let (ha, hb) = (hash(&a.ud), hash(&b.ud));
+            assert_ne!(ha, hb);
+            // Each merges the other's file as it was before either merge.
+            let (from_a, from_b) = (sync_file(&a), sync_file(&b));
+            let to_b = merged(merge_file(&from_a, "a", &mut b, DeleteGuard::Check));
+            let to_a = merged(merge_file(&from_b, "b", &mut a, DeleteGuard::Check));
+            for r in [&to_a, &to_b] {
+                assert_eq!(conflict_guids(&r.report), ["Songs"], "{:?}", r.report);
+                assert_eq!(r.report.conflicts[0].table, "Playlist");
+            }
+            // The greater hash wins on both computers; only the loser's
+            // playlist is replaced.
+            let (winner, updated_a, updated_b) = if ha > hb {
+                (["Song 1", "Song 2"], 0, 1)
+            } else {
+                (["Song 1", "Song 3"], 1, 0)
+            };
+            assert_eq!(labels(&a.ud, here), winner);
+            assert_eq!(labels(&b.ud, there), winner);
+            assert_eq!(
+                (to_a.report.updated, to_b.report.updated),
+                (updated_a, updated_b)
+            );
+            assert_eq!(a.ud.snapshot().unwrap(), b.ud.snapshot().unwrap());
+        }
+
+        #[test]
+        fn sync_rename_keeps_media_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let songs = a.ud.create_playlist("Songs").unwrap();
+            let (_, path) = own_file(&mut a.ud, songs, "V.mov", b"own video");
+            sync_both(&mut a, &mut b);
+            // To A, a rename is "Songs" deleted and "Songs 2" added, both
+            // using V.
+            let there = playlist_id(&b.ud, "Songs");
+            b.ud.rename_playlist(there, "Songs 2").unwrap();
+            let r = sync(&b, &mut a);
+            assert_eq!((r.deleted, r.report.added), (1, 1));
+            assert!(!has_playlist(&a.ud, "Songs"));
+            let renamed = playlist_id(&a.ud, "Songs 2");
+            assert_eq!(labels(&a.ud, renamed), ["V.mov"]);
+            let item = a.ud.playlist(renamed).unwrap().items[0].id;
+            assert_eq!(media_of(&a.ud, item).1, path);
+            assert_eq!(count(&a.ud, "IndependentMedia"), 1);
+            assert_eq!(
+                fs::read(a.ud.playlist_media_dir().join(&path)).unwrap(),
+                b"own video"
+            );
+            assert_foreign_keys_hold(&a.ud);
+        }
+
+        #[test]
+        fn old_base_without_playlists_only_adds() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let songs = a.ud.create_playlist("Songs").unwrap();
+            a.ud.add_library_item(songs, &song_track(1), "Song", 10)
+                .unwrap();
+            sync_both(&mut a, &mut b);
+            // A base from before playlists were synced.
+            a.bases
+                .get_mut("b")
+                .unwrap()
+                .0
+                .retain(|k, _| !matches!(k, crate::sync_snapshot::RowKey::Playlist(_)));
+            let there = playlist_id(&b.ud, "Songs");
+            b.ud.delete_playlist(there).unwrap();
+            b.ud.create_playlist("New").unwrap();
+            let r = sync(&b, &mut a);
+            assert_eq!((r.deleted, r.report.added), (0, 1));
+            assert!(r.report.conflicts.is_empty(), "{:?}", r.report.conflicts);
+            assert_eq!(labels(&a.ud, songs), ["Song"]);
+            assert!(has_playlist(&a.ud, "New"));
         }
     }
 }

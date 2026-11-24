@@ -341,6 +341,17 @@ Checked against one backup made by JW Library on iOS (schema version 16,
 2026-10). The backup itself is personal and not committed. [own]
 
 - A ZIP with `manifest.json`, `userData.db` and `default_thumbnail.png`.
+- Playlist media: one entry per file a playlist item uses (its media or its
+  thumbnail), named by its `IndependentMedia.FilePath` and stored, not
+  deflated. Pergament keeps these files in `playlist-media/` beside
+  `userData.db`, one file per `FilePath`. Backups (manual and rolling) and
+  `.jwlplaylist` files written here carry them; a file missing on disk is
+  left out and logged. A restore copies the entries the restored database
+  names into `playlist-media/` (at most 4 GiB each, through `.part` and a
+  rename) after the database is swapped in, then removes the files only the
+  previous database named; a file that cannot be copied leaves its item
+  unavailable. Only names that are safe plain file names are read or
+  written. Folder sync files never carry media. [own]
 - `manifest.json`: `creationDate`, `version` (1), `name`, `type` (0) and
   `userDataBackup` {`lastModifiedDate`, `hash`, `databaseName`,
   `deviceName`, `schemaVersion`}. `PRAGMA user_version` of the database
@@ -376,7 +387,7 @@ Checked against one backup made by JW Library on iOS (schema version 16,
 - `Note`: `Guid`, optional `UserMarkId` (the highlight it belongs to),
   `LocationId`, `Title`, `Content` (plain text), `LastModified`, `Created`,
   `BlockType`/`BlockIdentifier` (0 = whole page, else as in `BlockRange`).
-- `Tag` (`Type` 1 = user tag, 0 = favorites) and `TagMap` linking a tag to
+- `Tag` (`Type` 1 = user tag, 0 = favorites, 2 = playlist) and `TagMap` linking a tag to
   a note, a location or a playlist item, with a `Position` per tag.
   Pergament's publication favorites use type-1 locations with no page or
   track details, identified by key symbol, MEPS language and issue tag.
@@ -389,8 +400,48 @@ Checked against one backup made by JW Library on iOS (schema version 16,
   typed into workbook and study article fields: `TextTag` = the `id` of the
   field's `<textarea>` or `<input>`, e.g. `tt47`, not the `id` of its
   `div.gen-field`; a checkbox's `Value` is `1` or `0`, a text line's the text,
-  as in a JW Library backup with checked goals and dates from `lff`),
-  playlists and `IndependentMedia` (not used here yet).
+  as in a JW Library backup with checked goals and dates from `lff`) and
+  playlists (below).
+- Playlists use JW Library's own tables; Pergament adds none. A playlist
+  is a `Tag` with `Type` 2 and `Name` = the playlist name. Each item is a
+  `PlaylistItem` (`Label`, never empty; `StartTrimOffsetTicks`,
+  `EndTrimOffsetTicks`; `Accuracy`, 1 in the `PlaylistItemAccuracy` table;
+  `EndAction` 0-3; `ThumbnailFilePath`) linked to its playlist by a
+  `TagMap` row with `PlaylistItemId` and a 0-based `Position`, unique per
+  tag. A Library recording is a `PlaylistItemLocationMap` row
+  (`LocationId`, `MajorMultimediaType`, `BaseDurationTicks`) to a
+  `Location` of `Type` 2 (audio) or 3 (video) with `KeySymbol`, `Track`,
+  `IssueTagNumber` and `MepsLanguage`; song 1 of `sjjm` in German is
+  `Type 2, KeySymbol 'sjjm', Track 1, MepsLanguage 2, IssueTagNumber 0`. A
+  file is a `PlaylistItemIndependentMediaMap` row (`IndependentMediaId`,
+  `DurationTicks`) to `IndependentMedia` (`OriginalFilename`, `FilePath`
+  unique, `MimeType`, `Hash`). A thumbnail is an `IndependentMedia` row
+  too, named only by `ThumbnailFilePath`. `PlaylistItemMarker` rows with
+  their `PlaylistItemMarkerBibleVerseMap` and
+  `PlaylistItemMarkerParagraphMap` rows are kept and copied as they are;
+  Pergament does not show or edit them. Times are ticks, 10 000 000 per
+  second.
+- JW Library on iOS writes `Hash` as the SHA-256 with each byte in hex
+  without zero padding (byte `08` becomes `8`, so a hash can be shorter
+  than 64 characters). Pergament writes it the same way and never uses it
+  to check a file. A file added here gets `FilePath` = an uppercase UUID
+  v4, `.` and the lowercase extension (`OriginalFilename` the same),
+  `Label` = the original file name and `MimeType` from the extension
+  (video `mp4 m4v mov`, photo `jpg jpeg png gif webp heic`, audio
+  `mp3 m4a aac wav`). A photo plays for 4 seconds (`DurationTicks`
+  40 000 000). A `FilePath` from a database or zip is used only when it is
+  a plain file name: 1-128 characters, no `/`, `\`, `:` or NUL, not
+  starting with `.`, and none of the zip's fixed entry names. [own]
+- `.jwlplaylist`: one playlist, in the same ZIP layout as a backup, with
+  `manifest.type` 1 and `name` = the file name. Its `userData.db` has the
+  full schema (version 16) and only that playlist (tag id 1), its items,
+  locations, maps, markers and media rows, renumbered from 1; the media
+  files and `default_thumbnail.png` sit next to it. Export sets the
+  database's `LastModified` to now and the manifest `hash` to the SHA-256
+  of the database. Import needs the playlist tables and exactly one
+  type-2 tag; it adds the playlist like a merge adds a missing one (below),
+  named `Name (2)`, `Name (3)`, … when the name is taken, and does not
+  check the manifest hash. [own]
 - Bookmark slots belong to a publication-wide type-1 `Location`, for both
   Bibles and other publications. The target page remains a separate type-0
   location. JW Library databases reject type-0 locations without a document,
@@ -465,23 +516,51 @@ behavior. [own]
 - Deletions are not propagated by a manual merge: a row missing on one side
   stays, so an item deleted on one side comes back when the other side's
   backup is merged. Folder sync does pass them on (see "Sync").
-- Playlists and `IndependentMedia` are not merged.
+- Playlists are matched by name (`Tag` type 2). A playlist missing here is
+  added with its items; their `IndependentMedia` rows are matched by
+  `FilePath` and added when missing, and the files come from the backup's
+  media entries after the database is saved (a file that cannot be copied
+  is logged, the merge still succeeds). Two playlists with the same items,
+  compared as in the content hash, are left alone. Otherwise the newer
+  database's version wins: when that is the incoming one, the local items
+  are replaced by its items, and a manual merge then appends the local
+  file items whose media `FilePath` the incoming version lacks, so a file
+  added on this computer is not lost. When the local database is newer
+  (or the order is unknown), the local playlist stays and the incoming one
+  is reported as a conflict. `IndependentMedia` rows no item uses any more
+  are deleted with their files. A backup without the playlist tables
+  merges no playlists.
 
 #### Sync
 
 Folder sync merges another computer's file with the same steps, but
 three-way: against the *base*, a snapshot of that computer's file as it was
-at the last merge, kept in the app's data folder. [own]
+at the last merge, kept in the app's data folder. Sync files hold no
+playlist media entries; restore's media copying is not used for them.
+Instead, the media travels through `Pergament-media/` in the sync folder,
+one file per `FilePath`: before writing its own file, a computer copies
+every referenced file it has and the folder lacks there, and after
+merging it copies every referenced file it lacks from there (both through
+`.part` and a rename, never overwriting). Sync never deletes from
+`Pergament-media/`; a file that has not arrived only leaves its item
+unavailable until a later round.
+[own]
 
 - A snapshot holds every highlight (with its ranges), note, user tag,
-  bookmark, answer field, note or location `TagMap` row, reading plan and
-  ticked day under a key that does not depend on database ids, with a hash
-  of its content. The keys are the merge's: `UserMarkGuid`, note `Guid`,
+  bookmark, answer field, note or location `TagMap` row, reading plan,
+  ticked day and playlist under a key that does not depend on database
+  ids, with a hash of its content. The keys are the merge's: `UserMarkGuid`, note `Guid`,
   tag (`Type`, `Name`), bookmark publication location and `Slot`, answer
   page (without its language) and `TextTag`, for a `TagMap` row its tag and
   its note `Guid` or location, for a reading plan its `PlanKey` (hash: its
-  `StartDate`) and for a ticked day its plan's `PlanKey` and `Day` (a
-  constant hash).
+  `StartDate`), for a ticked day its plan's `PlanKey` and `Day` (a
+  constant hash) and for a playlist (`Tag` of `Type` 2) its `Name`. A
+  playlist is one row with all its items: its hash covers what the manual
+  merge compares (each item's label, trims, end action, markers, library
+  location or media `FilePath` and hash, thumbnail, in position order), not
+  the media files themselves. Its items' `TagMap` rows have no keys of their
+  own. A database without the playlist tables has no playlist keys, so a
+  base from before playlists were synced only adds them.
   Locations are compared normalized as above, so the same row has the same
   key and hash in every database. The database-wide `LastModified` and a
   note's `LastModified` are not part of the hash.
@@ -508,8 +587,8 @@ at the last merge, kept in the app's data folder. [own]
 - A row changed differently on both sides, or new on both sides with
   different content (e.g. the same bookmark slot), is settled the same way
   on every computer: a note by its own `LastModified`, the later one kept; a row
-  without a clock of its own (highlight, bookmark, answer, tag), or a note
-  changed at the same time, by its snapshot hash, the version with the
+  without a clock of its own (highlight, bookmark, answer, tag, playlist),
+  or a note changed at the same time, by its snapshot hash, the version with the
   greater hash (compared as text) kept. The database-wide `LastModified`
   is not used, as each computer would see itself as newer and keep its own
   version for good. The row is reported as a conflict.
@@ -527,6 +606,12 @@ at the last merge, kept in the app's data folder. [own]
   the plan was restarted here can survive). Start dates changed on both
   sides settle by the earlier start, as in a manual merge, and are
   reported. An untick is the deletion of a ticked day.
+- A playlist changed on one side only is taken as it is: the manual
+  merge's rule that keeps local file items the incoming version lacks does
+  not apply, so an item removed on one computer is removed on the other.
+  A playlist changed on both sides settles by the greater snapshot hash, as
+  above: both computers end with the same version and both report the
+  conflict.
 - The order of a tag's notes is not merged. A `TagMap` row's hash is its
   rank in the tag, but the merge only asks whether the row is there, so
   moving a note within a tag is neither a change nor a conflict, and two
@@ -536,7 +621,11 @@ at the last merge, kept in the app's data folder. [own]
   note's `TagMap` rows go with the note; a tag is deleted only when no
   `TagMap` row refers to it any more, otherwise it is kept and reported; an
   answer is deleted from every location of its page, as in the editor; a
-  reading plan's ticked days go with the plan. A
+  reading plan's ticked days go with the plan; a playlist's items go with
+  the playlist. `IndependentMedia` rows no item uses any more are deleted
+  once, after the playlists are merged (an incoming playlist, e.g. one
+  renamed there, may use the media of a deleted one), still in the
+  transaction; their files only after it commits. A
   deleted row is missing from the incoming file by definition, so the merge
   that follows never adds it back or updates it.
 - Should two rows of one database share a key (e.g. two `Location` rows
@@ -551,21 +640,22 @@ at the last merge, kept in the app's data folder. [own]
 - Without a base (the first merge of a computer's file), the merge is a
   manual merge: nothing is deleted.
 - The deletions are checked for each kind of row apart: highlights and
-  notes, answers, bookmarks, tags with their `TagMap` rows, and reading
-  plans with their ticked days. When in any kind they are more than half of
-  the local rows of that kind and more than 5 rows, the merge stops before
+  notes, answers, bookmarks, tags with their `TagMap` rows, reading plans
+  with their ticked days, and playlists. When in any kind they are more
+  than half of the local rows of that kind and more than 5 rows, the merge stops before
   writing anything, including the safety copy, and asks, giving the
   deletions and local rows summed over all kinds. "Apply deletions" runs it
   as computed, after a rolling backup of the local data (written even when
   rolling backups are off); if that backup fails, the deletions wait and the
-  sync status shows the error. "Keep my data" runs it without deletions, and
+  sync status shows the error. Each rolling backup contains all playlist
+  media. "Keep my data" runs it without deletions, and
   the merged file still becomes the new base. That protects only this
   computer: the rows the other computer deleted stay deleted there, as this
   computer's own file now holds them unchanged against its base on the other
   side. To recover them on the other computer, restore a backup there.
 - A computer whose synced rows are all gone (no highlight, note, user tag,
-  bookmark, answer or reading plan) while its bases still hold rows lost or
-  reset its database. It is treated as new: before merging, it drops its
+  bookmark, answer, reading plan or playlist) while its bases still hold
+  rows lost or reset its database. It is treated as new: before merging, it drops its
   bases and its sync state, so every merge only adds. Empty bases (two
   empty computers) do not count, so nothing is merged again and again.
 - A computer never writes its own file while it has no synced rows: another

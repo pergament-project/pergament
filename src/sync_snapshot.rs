@@ -6,12 +6,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::Result;
-use crate::userdata::{ANSWER_SIBLINGS, TAG_USER, UserData, check_database, unpack_backup};
+use crate::userdata::{
+    ANSWER_SIBLINGS, PLAYLIST_TABLES, TAG_PLAYLIST, TAG_USER, UserData, check_database,
+    unpack_backup,
+};
 
 /// A `Location` row by its content, normalized like the merge matches
 /// locations: a missing issue, document, book or chapter counts as 0, the
@@ -56,6 +59,8 @@ pub enum RowKey {
     ReadingPlan(String),
     /// `ReadingPlanDay`, a ticked day, by its plan's `PlanKey` and `Day`.
     ReadingPlanDay(String, i64),
+    /// A playlist (`Tag` of `Type` 2) with all its items, by `Name`.
+    Playlist(String),
 }
 
 /// Every synced row of a database: key → content hash.
@@ -113,6 +118,8 @@ pub(crate) enum RowRef {
     ReadingPlan(i64),
     /// `ReadingPlanId` and `Day`.
     ReadingPlanDay(i64, i64),
+    /// The playlist's `TagId`.
+    Playlist(i64),
 }
 
 /// Every synced row of a database: key → content hash and the row it was
@@ -129,6 +136,35 @@ pub(crate) fn rows_of_file(path: &Path) -> Result<Rows> {
 /// Hex SHA-256 of `content` as JSON.
 fn hash(content: &impl Serialize) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(content)?)))
+}
+
+/// The `Location` columns of a [`LocKey`], normalized; read with [`loc_key_at`].
+const LOC_KEY_COLUMNS: &str = "Type, KeySymbol, MepsLanguage, IFNULL(IssueTagNumber, 0),
+    IFNULL(DocumentId, 0), IFNULL(BookNumber, 0), IFNULL(ChapterNumber, 0), Track";
+
+/// The key in the [`LOC_KEY_COLUMNS`] of row `r`, starting at column `at`.
+fn loc_key_at(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<LocKey> {
+    Ok(LocKey {
+        kind: r.get(at)?,
+        key_symbol: r.get(at + 1)?,
+        meps_language: r.get(at + 2)?,
+        issue_tag: r.get(at + 3)?,
+        document_id: r.get(at + 4)?,
+        book: r.get(at + 5)?,
+        chapter: r.get(at + 6)?,
+        track: r.get(at + 7)?,
+    })
+}
+
+/// The key of `Location` `id` in database `schema` ("main" or "inc").
+pub(crate) fn loc_key(conn: &Connection, schema: &str, id: i64) -> Result<Option<LocKey>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {LOC_KEY_COLUMNS} FROM {schema}.Location WHERE LocationId = ?1"),
+            [id],
+            |r| loc_key_at(r, 0),
+        )
+        .optional()?)
 }
 
 fn has_table(conn: &Connection, table: &str) -> Result<bool> {
@@ -148,26 +184,10 @@ pub(crate) fn rows_of(conn: &Connection) -> Result<Rows> {
     };
 
     let locations: HashMap<i64, LocKey> = {
-        let mut stmt = conn.prepare(
-            "SELECT LocationId, Type, KeySymbol, MepsLanguage, IFNULL(IssueTagNumber, 0),
-                    IFNULL(DocumentId, 0), IFNULL(BookNumber, 0), IFNULL(ChapterNumber, 0), Track
-             FROM Location",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                LocKey {
-                    kind: r.get(1)?,
-                    key_symbol: r.get(2)?,
-                    meps_language: r.get(3)?,
-                    issue_tag: r.get(4)?,
-                    document_id: r.get(5)?,
-                    book: r.get(6)?,
-                    chapter: r.get(7)?,
-                    track: r.get(8)?,
-                },
-            ))
-        })?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT LocationId, {LOC_KEY_COLUMNS} FROM Location"
+        ))?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, loc_key_at(r, 1)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     let loc = |id: Option<i64>| id.and_then(|id| locations.get(&id).cloned());
@@ -249,9 +269,9 @@ pub(crate) fn rows_of(conn: &Connection) -> Result<Rows> {
         }
     }
 
-    // Tag maps of notes and locations (playlist items are not merged): the
-    // rank among the tag's notes and locations by `Position`, so a gap in
-    // the numbering changes nothing.
+    // Tag maps of notes and locations (playlist items are part of their
+    // `RowKey::Playlist`): the rank among the tag's notes and locations by
+    // `Position`, so a gap in the numbering changes nothing.
     {
         let mut stmt = conn.prepare(
             "SELECT m.TagId, t.Type, t.Name, n.Guid, m.LocationId, m.TagMapId
@@ -377,6 +397,29 @@ pub(crate) fn rows_of(conn: &Connection) -> Result<Rows> {
         }
     }
 
+    // Playlists: all their items as the merge compares them (labels,
+    // trims, markers, media by `FilePath`, thumbnails), in position order.
+    // Missing in old databases.
+    let mut has_playlists = true;
+    for table in PLAYLIST_TABLES {
+        has_playlists &= has_table(conn, table)?;
+    }
+    if has_playlists {
+        let mut stmt =
+            conn.prepare("SELECT Name, TagId FROM Tag WHERE Type = ?1 ORDER BY TagId")?;
+        let playlists: Vec<(String, i64)> = stmt
+            .query_map([TAG_PLAYLIST], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (name, id) in playlists {
+            let content = crate::playlist::content(conn, "main", id)?;
+            put(
+                RowKey::Playlist(name),
+                hash(&content)?,
+                RowRef::Playlist(id),
+            );
+        }
+    }
+
     Ok(rows)
 }
 
@@ -409,7 +452,7 @@ pub enum SyncOutcome {
 pub enum DeleteGuard {
     /// Delete them, unless in some kind of row (highlights and notes,
     /// answers, bookmarks, tags with their tag maps, reading plans with
-    /// their ticked days) that would delete more
+    /// their ticked days, playlists) that would delete more
     /// than half of the local rows of that kind and more than 5; then stop
     /// with [`SyncOutcome::NeedsConfirmation`].
     Check,
@@ -457,9 +500,9 @@ pub(crate) struct Classified {
 }
 
 /// The kinds of rows the mass-delete guard counts apart: highlights and
-/// notes, answers, bookmarks, tags with their tag maps, and reading plans
-/// with their ticked days.
-const GUARD_KINDS: usize = 5;
+/// notes, answers, bookmarks, tags with their tag maps, reading plans with
+/// their ticked days, and playlists.
+const GUARD_KINDS: usize = 6;
 
 fn guard_kind(key: &RowKey) -> usize {
     match key {
@@ -468,6 +511,7 @@ fn guard_kind(key: &RowKey) -> usize {
         RowKey::Bookmark(..) => 2,
         RowKey::Tag(..) | RowKey::TagMap(..) => 3,
         RowKey::ReadingPlan(_) | RowKey::ReadingPlanDay(..) => 4,
+        RowKey::Playlist(_) => 5,
     }
 }
 
@@ -1396,6 +1440,166 @@ mod tests {
         let l = snap(&local);
         // There: the plan and days 5 to 10 only.
         let i = snap(&[&local[..1], &local[5..11]].concat());
+        let c = classify(&l, &i, &l);
+        assert_eq!(c.delete.len(), 9);
+        assert_eq!(c.needs_confirmation(&rows(&l)), None);
+    }
+
+    fn playlist_hash(ud: &UserData, name: &str) -> String {
+        ud.snapshot().unwrap().0[&RowKey::Playlist(name.into())].clone()
+    }
+
+    #[test]
+    fn rows_of_reads_playlists() {
+        use crate::playlist::{ItemKind, LibraryRef};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ud = UserData::open(tmp.path().join(DB_NAME)).unwrap();
+        // A user tag first, so the playlist ids are not 1.
+        ud.save_note(
+            Some(&bible(1)),
+            None,
+            &NoteInput {
+                title: "N".into(),
+                tags: vec!["study".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let songs = ud.create_playlist("Songs").unwrap();
+        let other = ud.create_playlist("Other").unwrap();
+        let song = |track| LibraryRef {
+            key_symbol: "sjjm".into(),
+            track,
+            issue_tag: 0,
+            meps_language: 2,
+            kind: ItemKind::Audio,
+        };
+        let first = ud.add_library_item(songs, &song(1), "Song 1", 10).unwrap();
+        let photo = tmp.path().join("photo.png");
+        std::fs::write(&photo, b"\x89PNG photo").unwrap();
+        let file = ud.add_file_item(songs, &photo).unwrap();
+
+        let rows = rows_of(ud.conn()).unwrap();
+        assert_eq!(
+            rows[&RowKey::Playlist("Songs".into())].1,
+            RowRef::Playlist(songs)
+        );
+        assert_eq!(
+            rows[&RowKey::Playlist("Other".into())].1,
+            RowRef::Playlist(other)
+        );
+        let playlists = rows
+            .keys()
+            .filter(|k| matches!(k, RowKey::Playlist(_)))
+            .count();
+        assert_eq!(playlists, 2);
+        // Neither a tag nor tag maps of their own: one key per playlist.
+        assert_eq!(
+            rows.keys()
+                .filter(|k| matches!(k, RowKey::Tag(..) | RowKey::TagMap(..)))
+                .cloned()
+                .collect::<Vec<_>>(),
+            [
+                RowKey::Tag(TAG_USER, "study".into()),
+                RowKey::TagMap(
+                    TAG_USER,
+                    "study".into(),
+                    TagTarget::Note(ud.all_notes(None).unwrap()[0].guid.clone())
+                ),
+            ]
+        );
+
+        let mut hash = playlist_hash(&ud, "Songs");
+        let mut changes = |ud: &UserData, what: &str| {
+            let now = playlist_hash(ud, "Songs");
+            assert_ne!(now, hash, "{what}");
+            hash = now;
+        };
+        ud.add_library_item(songs, &song(2), "Song 2", 10).unwrap();
+        changes(&ud, "added");
+        ud.move_playlist_item(songs, first, 2).unwrap();
+        changes(&ud, "moved");
+        ud.conn()
+            .execute(
+                "UPDATE PlaylistItem SET Label = 'Renamed' WHERE PlaylistItemId = ?1",
+                [first],
+            )
+            .unwrap();
+        changes(&ud, "relabelled");
+        ud.set_playlist_item_thumbnail(file, b"\xff\xd8 jpeg")
+            .unwrap();
+        changes(&ud, "thumbnail");
+        ud.set_playlist_item_thumbnail(file, b"\xff\xd8 other jpeg")
+            .unwrap();
+        changes(&ud, "thumbnail changed");
+
+        // The file on disk is not part of the hash.
+        let before = ud.snapshot().unwrap();
+        for entry in std::fs::read_dir(ud.playlist_media_dir()).unwrap() {
+            std::fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        assert_eq!(ud.snapshot().unwrap(), before);
+        assert_eq!(
+            Snapshot::of(&rows_of(ud.conn()).unwrap()),
+            before,
+            "deterministic"
+        );
+
+        // An old or JW Library database without the playlist tables.
+        ud.conn()
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DROP TABLE PlaylistItemMarkerBibleVerseMap;
+                 DROP TABLE PlaylistItemMarkerParagraphMap;
+                 DROP TABLE PlaylistItemMarker;
+                 DROP TABLE PlaylistItemLocationMap;
+                 DROP TABLE PlaylistItemIndependentMediaMap;
+                 DROP TABLE PlaylistItem;
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        let rows = rows_of(ud.conn()).unwrap();
+        assert!(!rows.keys().any(|k| matches!(k, RowKey::Playlist(_))));
+        assert!(rows.contains_key(&RowKey::Tag(TAG_USER, "study".into())));
+    }
+
+    fn playlist(name: &str) -> RowKey {
+        RowKey::Playlist(name.into())
+    }
+
+    #[test]
+    fn guard_counts_playlists_apart() {
+        // 10 playlists here, of which the other device deleted 6.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut here = UserData::open(tmp.path().join("a").join(DB_NAME)).unwrap();
+        let mut there = UserData::open(tmp.path().join("b").join(DB_NAME)).unwrap();
+        for n in 0..10 {
+            here.create_playlist(&format!("P{n}")).unwrap();
+        }
+        for n in 0..4 {
+            there.create_playlist(&format!("P{n}")).unwrap();
+        }
+        let file = tmp.path().join("b.jwlibrary");
+        there.export_backup(&file).unwrap();
+        let base = here.snapshot().unwrap();
+        let before = here.fingerprint().unwrap();
+        assert_eq!(
+            here.sync_merge(&file, Some(&base), DeleteGuard::Check)
+                .unwrap(),
+            SyncOutcome::NeedsConfirmation {
+                deletions: 6,
+                total: 10
+            }
+        );
+        assert_eq!(here.fingerprint().unwrap(), before);
+
+        // 5 of 5 highlights and 4 of 10 playlists: 9 of 15 rows, but
+        // neither kind on its own passes the guard.
+        let mut local: Vec<(RowKey, &str)> =
+            (0..10).map(|n| (playlist(&n.to_string()), "p")).collect();
+        local.extend([mark("1"), mark("2"), mark("3"), mark("4"), mark("5")].map(|m| (m, "m")));
+        let l = snap(&local);
+        let i = snap(&local[4..10]);
         let c = classify(&l, &i, &l);
         assert_eq!(c.delete.len(), 9);
         assert_eq!(c.needs_confirmation(&rows(&l)), None);

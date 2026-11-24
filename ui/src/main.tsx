@@ -17,6 +17,7 @@ import { MediaCategoryView } from "./views/media";
 import { MeetingsView } from "./views/meetings";
 import { OnlineView } from "./views/online";
 import { PersonalView } from "./views/personal";
+import { PlaylistView } from "./views/playlist";
 import { PublicationView } from "./views/publication";
 import { ReaderView } from "./views/reader";
 import { SettingsView } from "./views/settings";
@@ -61,6 +62,8 @@ function CurrentView() {
       return <MeetingsView week={view.week} />;
     case "personal":
       return <PersonalView />;
+    case "playlist":
+      return <PlaylistView key={view.id} />;
   }
 }
 

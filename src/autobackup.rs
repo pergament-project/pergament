@@ -151,6 +151,31 @@ mod tests {
     }
 
     #[test]
+    fn includes_playlist_media() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ud = open(tmp.path());
+        let tag = ud.create_playlist("Fotos").unwrap();
+        let png = tmp.path().join("IMG_3019.png");
+        fs::write(&png, b"png").unwrap();
+        ud.add_file_item(tag, &png).unwrap();
+        let name = fs::read_dir(ud.playlist_media_dir())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .into_string()
+            .unwrap();
+        let written = write_rolling(&ud, &tmp.path().join(ROLLING_DIR), 10, None)
+            .unwrap()
+            .unwrap();
+        let mut zip = zip::ZipArchive::new(fs::File::open(&written.path).unwrap()).unwrap();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut zip.by_name(&name).unwrap(), &mut bytes).unwrap();
+        assert_eq!(bytes, b"png");
+    }
+
+    #[test]
     fn prune_keeps_newest_and_ignores_others() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();

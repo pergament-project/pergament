@@ -18,6 +18,7 @@ pub mod navigate;
 pub mod net;
 pub mod note_export;
 pub mod note_markdown;
+pub mod playlist;
 pub mod reader;
 pub mod reading_plans;
 pub mod remote;

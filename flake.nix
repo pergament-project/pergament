@@ -33,6 +33,9 @@
           openssl
         ];
 
+        # GStreamer plugin for Tauri's asset:// protocol (video/audio playback on Linux).
+        gstPluginAsset = pkgs.cargo-tauri.gst-plugin;
+
         version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
         # Flake builds carry the commit as semver build metadata (1.6.0+abc1234), so
         # a build from main shows which commit it is. The release workflow does not
@@ -123,7 +126,7 @@
             wrapGAppsHook3
             copyDesktopItems
           ];
-          buildInputs = [ pkgs.sqlite ] ++ tauriLibs
+          buildInputs = [ pkgs.sqlite gstPluginAsset ] ++ tauriLibs
             # WebKitGTK plays media through GStreamer; the recordings are H.264/AAC MP4,
             # which needs the libav decoders.
             ++ (with pkgs.gst_all_1; [
@@ -222,7 +225,7 @@
           ];
 
           buildInputs =
-            [ pkgs.sqlite ]
+            [ pkgs.sqlite gstPluginAsset ]
             ++ tauriLibs
             # WebKitGTK plays media through GStreamer. The recordings are H.264/AAC
             # MP4, which needs the libav decoders.

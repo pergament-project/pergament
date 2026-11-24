@@ -1,6 +1,7 @@
 //! Tests against user-supplied publications. Skipped unless
 //! `PERGAMENT_TEST_JWPUB` (study Bible) / `PERGAMENT_TEST_JWPUB_WP` (Watchtower)
-//! / `PERGAMENT_TEST_JWPUB_LFF` (lff book) are set.
+//! / `PERGAMENT_TEST_JWPUB_LFF` (lff book) / `PERGAMENT_TEST_JWLPLAYLIST`
+//! (JW Library playlist, `testdata/Songs.jwlplaylist`) are set.
 
 use std::path::PathBuf;
 
@@ -536,4 +537,160 @@ fn note_anchor_resolves_john_3_16() {
     assert!(quote.ends_with(['.', '!', '?', '"', '”', '“', '»', '«']), "{quote}");
     let reference = anchor.reference.unwrap();
     assert!(reference.ends_with("3:16"), "{reference}");
+}
+
+/// The values of one imported playlist item, read from the database:
+/// label, accuracy, end action, trims, location (key symbol, track, type,
+/// language, issue), multimedia type, base duration, media (path, mime,
+/// original name, hash, duration) and thumbnail path.
+fn playlist_rows(ud: &pergament::userdata::UserData, tag: i64) -> Vec<Vec<rusqlite::types::Value>> {
+    let conn = rusqlite::Connection::open(ud.path()).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT i.Label, i.Accuracy, i.EndAction, i.StartTrimOffsetTicks,
+                    i.EndTrimOffsetTicks, l.KeySymbol, l.Track, l.Type, l.MepsLanguage,
+                    l.IssueTagNumber, lm.MajorMultimediaType, lm.BaseDurationTicks,
+                    m.FilePath, m.MimeType, m.OriginalFilename, m.Hash, im.DurationTicks,
+                    i.ThumbnailFilePath
+             FROM TagMap t JOIN PlaylistItem i ON i.PlaylistItemId = t.PlaylistItemId
+             LEFT JOIN PlaylistItemLocationMap lm ON lm.PlaylistItemId = i.PlaylistItemId
+             LEFT JOIN Location l ON l.LocationId = lm.LocationId
+             LEFT JOIN PlaylistItemIndependentMediaMap im ON im.PlaylistItemId = i.PlaylistItemId
+             LEFT JOIN IndependentMedia m ON m.IndependentMediaId = im.IndependentMediaId
+             WHERE t.TagId = ?1 ORDER BY t.Position",
+        )
+        .unwrap();
+    stmt.query_map([tag], |r| (0..18).map(|i| r.get(i)).collect())
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// The JW Library sample playlist from an iPhone imports with every value,
+/// file and thumbnail, and survives an export and a second import.
+#[test]
+fn imports_jw_library_playlist() {
+    use pergament::playlist::{ItemKind, ItemSource};
+    use rusqlite::types::Value::{Integer as I, Null, Text as T};
+
+    let Some(path) = fixture("PERGAMENT_TEST_JWLPLAYLIST") else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut ud =
+        pergament::userdata::UserData::open(tmp.path().join("a").join("userData.db")).unwrap();
+    let id = ud.import_playlist(&path).unwrap();
+    let playlist = ud.playlist(id).unwrap();
+    assert_eq!(playlist.name, "Songs");
+    let labels: Vec<&str> = playlist.items.iter().map(|i| i.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        [
+            "1. Jehovas großartige Eigenschaften",
+            "JW Broadcasting November 2026",
+            "IMG_3019.png",
+            "IMG_2974.mov"
+        ]
+    );
+    let kinds: Vec<ItemKind> = playlist.items.iter().map(|i| i.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            ItemKind::Audio,
+            ItemKind::Video,
+            ItemKind::Image,
+            ItemKind::Video
+        ]
+    );
+    let durations: Vec<i64> = playlist.items.iter().map(|i| i.duration_ticks).collect();
+    assert_eq!(
+        durations,
+        [1_378_840_000, 36_009_720_000, 40_000_000, 139_000_000]
+    );
+    for item in &playlist.items {
+        assert!(
+            item.thumbnail.as_ref().is_some_and(|t| t.is_file()),
+            "{}",
+            item.label
+        );
+        if let ItemSource::File { available, .. } = &item.source {
+            assert!(available, "{}", item.label);
+        }
+    }
+
+    let s = |v: &str| T(v.into());
+    let rows = playlist_rows(&ud, id);
+    let common = |label: &str| vec![s(label), I(1), I(0), Null, Null];
+    let expected: [Vec<rusqlite::types::Value>; 4] = [
+        [
+            &common("1. Jehovas großartige Eigenschaften")[..],
+            &[s("sjjm"), I(1), I(2), I(2), I(0), I(0), I(1_378_840_000)],
+            &[Null, Null, Null, Null, Null],
+            &[s("06D2E671-01A0-49C8-9642-DCFA28BF20E7.jpeg")],
+        ]
+        .concat(),
+        [
+            &common("JW Broadcasting November 2026")[..],
+            &[
+                s("jwb-143"),
+                I(1),
+                I(3),
+                I(2),
+                I(0),
+                I(2),
+                I(36_009_720_000),
+            ],
+            &[Null, Null, Null, Null, Null],
+            &[s("4782EE3E-0366-4379-AF89-F9AC49C5C6BE.jpeg")],
+        ]
+        .concat(),
+        [
+            &common("IMG_3019.png")[..],
+            &[Null, Null, Null, Null, Null, Null, Null],
+            &[
+                s("D5D214AC-7584-4E32-BB72-D2AB75AFED6E.png"),
+                s("image/png"),
+                s("41B9A189-A440-47CB-865E-4B83A420D92B.png"),
+                s("c924d6669f8afa33c7e9925944f1365f7de94785621fa6c67e4bc4c78a14437"),
+                I(40_000_000),
+            ],
+            &[s("2C4646A7-18DA-4BC3-A186-33A129645B4E.jpeg")],
+        ]
+        .concat(),
+        [
+            &common("IMG_2974.mov")[..],
+            &[Null, Null, Null, Null, Null, Null, Null],
+            &[
+                s("EDB6A882-2CF0-482C-A3E1-4771B71491FC.mov"),
+                s("video/quicktime"),
+                s("3646BE69-E18A-4F83-937A-7F7E6391EA9B.mov"),
+                s("9aae6f6a697ccff8983b964d1f53d3275cd992a6f8fe30a24d702d5728877e"),
+                I(139_000_000),
+            ],
+            &[s("A1B0B64C-20FA-4163-A2A5-3F9E41842C05.jpeg")],
+        ]
+        .concat(),
+    ];
+    assert_eq!(rows, expected);
+
+    // The video is copied whole.
+    let video = "EDB6A882-2CF0-482C-A3E1-4771B71491FC.mov";
+    let copied = std::fs::read(ud.playlist_media_dir().join(video)).unwrap();
+    assert!(copied.len() as u64 <= 78_602_157);
+    let mut zip = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+    let mut entry = Vec::new();
+    std::io::Read::read_to_end(&mut zip.by_name(video).unwrap(), &mut entry).unwrap();
+    assert_eq!(copied, entry);
+
+    // Export and import again: the same playlist.
+    let exported = tmp.path().join("Songs.jwlplaylist");
+    ud.export_playlist(id, &exported).unwrap();
+    let mut other =
+        pergament::userdata::UserData::open(tmp.path().join("b").join("userData.db")).unwrap();
+    let again = other.import_playlist(&exported).unwrap();
+    assert_eq!(playlist_rows(&other, again), rows);
+    assert_eq!(
+        std::fs::read(other.playlist_media_dir().join(video)).unwrap(),
+        copied
+    );
 }

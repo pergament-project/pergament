@@ -207,7 +207,14 @@ export function MediaCard({ media, from, store, onPlay, lang, compact }: CardPro
           </span>
         )}
         <DownloadButton media={media} from={from} store={store} className="absolute bottom-1.5 right-1.5" />
-        <TileMenu target={{ kind: "media", key: media.key, langCode: lang ?? appLang }} />
+        <TileMenu target={{
+            kind: "media",
+            key: media.key,
+            langCode: lang ?? appLang,
+            title: media.title,
+            duration: media.duration,
+            image: media.image,
+          }} />
       </div>
       <button onClick={onPlay} className="mt-1.5 line-clamp-2 text-left text-[13px] font-medium leading-snug hover:underline">
         {media.title}
@@ -230,7 +237,7 @@ export function MediaRow({ media, from, store, onPlay }: CardProps) {
       </button>
       <DownloadButton media={media} from={from} store={store} />
       <TileMenu
-        target={{ kind: "media", key: media.key, langCode: lang }}
+        target={{ kind: "media", key: media.key, langCode: lang, title: media.title, duration: media.duration, image: media.image }}
         className="right-12 top-1/2 -translate-y-1/2"
       />
     </div>
@@ -276,7 +283,14 @@ export function DownloadedCard({
         </button>
       )}
       <TileMenu
-        target={{ kind: "media", key: item.key, langCode: item.langCode }}
+        target={{
+          kind: "media",
+          key: item.key,
+          langCode: item.langCode,
+          title: item.title,
+          duration: item.duration,
+          image: item.image,
+        }}
         className="right-12 top-1/2 -translate-y-1/2"
       />
     </div>

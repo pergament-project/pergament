@@ -167,13 +167,18 @@ interface AppContextValue {
   userVersion: number;
   /** Bumped when the floating editor saved or deleted a note. */
   notesVersion: number;
+  /** Bumped when a playlist was created, renamed, deleted or changed, or when user data was restored, merged or synced. */
+  playlistsVersion: number;
   favorites: PublicationKey[];
   setFavorite: (key: PublicationKey, favorite: boolean) => Promise<void>;
   createBackup: () => Promise<void>;
   restoreBackup: () => Promise<void>;
-  /** The recording being played; it keeps playing while the user navigates. */
-  player: { id: number; item: PlayerItem } | null;
+  /** The recordings being played, and which one to start with; they keep playing while the user navigates. */
+  player: { id: number; items: PlayerItem[]; index: number } | null;
+  /** Play one recording: a queue of one. */
   playItem: (item: PlayerItem) => void;
+  /** Play the items in order from `index`, as "Play all" does. */
+  playQueue: (items: PlayerItem[], index: number) => void;
   /** Look up a recording that a publication links to and play it. */
   playRecording: (media: MediaRef) => Promise<void>;
   /** Open one of the app's own links, such as a Bible verse in a note, in the Bible chosen for the language. */
@@ -207,6 +212,8 @@ interface AppContextValue {
   keepNote: () => void;
   /** Tell the views that a note was saved or deleted. */
   notesChanged: () => void;
+  /** Tell the views that a playlist changed. */
+  playlistsChanged: () => void;
   /** The second display window and what is sent to it. */
   display: { enabled: boolean; setEnabled: (on: boolean) => Promise<void>; send: (message: DisplayMessage) => void };
   /** The picture in the large view, if one is open. */
@@ -549,6 +556,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
           return;
         }
         setUserVersion((v) => v + 1);
+        setPlaylistsVersion((v) => v + 1);
         toast(mergeToast(report));
         if (report.conflicts.length > 0) {
           // The merge is done either way; without a dialog the list goes to a toast.
@@ -580,6 +588,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
             (s.device ? t(" from {device}", { device: s.device }) : ""),
         );
         setUserVersion((v) => v + 1);
+        setPlaylistsVersion((v) => v + 1);
       } catch (e) {
         toast(t("Restore failed: {error}", { error: String(e) }));
       }
@@ -639,7 +648,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
   // A sync merge changed the data: reload what the views show.
   useEffect(() => {
-    const changed = listen("user-data-changed", () => setUserVersion((v) => v + 1));
+    const changed = listen("user-data-changed", () => {
+      setUserVersion((v) => v + 1);
+      setPlaylistsVersion((v) => v + 1);
+    });
     return () => void changed.then((f) => f());
   }, []);
 
@@ -686,12 +698,22 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (!playerRef.current) sendDisplay({ type: "idle" });
   }, [sendDisplay]);
 
-  const playItem = useCallback((item: PlayerItem) => setPlayer({ id: Date.now(), item }), []);
+  const playQueue = useCallback(
+    (items: PlayerItem[], index: number) => {
+      // Nothing to play leaves the player as it is; an index out of range starts at the nearest end.
+      if (items.length === 0) return;
+      setPlayer({ id: Date.now(), items, index: Math.min(Math.max(0, Math.trunc(index) || 0), items.length - 1) });
+    },
+    [],
+  );
+  const playItem = useCallback((item: PlayerItem) => playQueue([item], 0), [playQueue]);
   const closePlayer = useCallback(() => setPlayer(null), []);
   /** Whether unsaved text in the editor may be dropped: true when there is none or the user agrees. */
   const mayDiscard = useCallback(async () => !noteDirty.current || (await askDiscard()), []);
   const [notesVersion, setNotesVersion] = useState(0);
   const notesChanged = useCallback(() => setNotesVersion((v) => v + 1), []);
+  const [playlistsVersion, setPlaylistsVersion] = useState(0);
+  const playlistsChanged = useCallback(() => setPlaylistsVersion((v) => v + 1), []);
   // The note window: the app sends it a note; one that opens later asks for it when ready.
   const lastNoteMessage = useRef<NoteWindowMessage | null>(null);
   const noteWindowDirty = useRef(false);
@@ -993,12 +1015,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       loadCatalog,
       userVersion,
       notesVersion,
+      playlistsVersion,
       favorites,
       setFavorite,
       createBackup,
       restoreBackup,
       player,
       playItem,
+      playQueue,
       playRecording,
       openLink,
       setLinkHandler,
@@ -1013,6 +1037,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       releaseNote,
       keepNote,
       notesChanged,
+      playlistsChanged,
       display: { enabled: displayOn, setEnabled: setSecondDisplay, send: sendDisplay },
       viewer,
       showImage,
@@ -1050,12 +1075,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       loadCatalog,
       userVersion,
       notesVersion,
+      playlistsVersion,
       favorites,
       setFavorite,
       createBackup,
       restoreBackup,
       player,
       playItem,
+      playQueue,
       playRecording,
       openLink,
       setLinkHandler,
@@ -1070,6 +1097,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       releaseNote,
       keepNote,
       notesChanged,
+      playlistsChanged,
       displayOn,
       setSecondDisplay,
       sendDisplay,
