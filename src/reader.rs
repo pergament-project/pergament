@@ -115,6 +115,13 @@ impl Publication {
         })
     }
 
+    /// [`Publication::open`], or `None` with the error logged.
+    pub(crate) fn open_or_log(library: &Library, entry: &Entry) -> Option<Self> {
+        Self::open(library, entry)
+            .inspect_err(|e| eprintln!("cannot open {}: {e}", entry.dir_name))
+            .ok()
+    }
+
     /// The downloaded publication user data refers to by key symbol, language and issue.
     pub fn find(
         library: &Library,
@@ -126,8 +133,11 @@ impl Publication {
             if entry.meps_language != meps_language {
                 continue;
             }
-            let publication = Publication::open(library, &entry)?;
-            if publication.key_symbol()? == key_symbol
+            // A broken download must not hide the one asked for.
+            let Some(publication) = Publication::open_or_log(library, &entry) else {
+                continue;
+            };
+            if publication.key_symbol().ok().as_deref() == Some(key_symbol)
                 && entry.issue_tag.parse::<i64>().unwrap_or(0) == issue_tag
             {
                 return Ok(Some(publication));

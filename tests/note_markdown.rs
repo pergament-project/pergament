@@ -23,6 +23,39 @@ fn finds_a_publication_by_user_data_key() {
     assert!(Publication::find(&lib, "xyz", 0, 0).unwrap().is_none());
 }
 
+#[test]
+fn an_unreadable_publication_does_not_hide_the_others() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut lib = Library::open(tmp.path().join("lib")).unwrap();
+    for issue in ["0", "202401"] {
+        let file = tmp.path().join(format!("{issue}.jwpub"));
+        Fixture {
+            issue: issue.into(),
+            ..Fixture::default()
+        }
+        .write_to(&file);
+        lib.import(&file).unwrap();
+    }
+    let entries = lib.list().unwrap();
+    assert_eq!(entries.len(), 2);
+    // Break the one looked at first, so it stands in front of the other.
+    std::fs::remove_file(lib.db_path(&entries[0])).unwrap();
+    let wanted = &entries[1];
+    let issue = wanted.issue_tag.parse::<i64>().unwrap_or(0);
+
+    let found = Publication::find(&lib, "tst", 0, issue).unwrap().unwrap();
+    assert_eq!(found.entry().dir_name, wanted.dir_name);
+    let loc = Loc {
+        key_symbol: "tst".into(),
+        meps_language: 0,
+        issue_tag: issue,
+        document_id: Some(1),
+        book: None,
+        chapter: None,
+    };
+    resolve(&lib, Some(&loc), Some("Stored"), 0, None).unwrap();
+}
+
 fn library(fixture: Fixture) -> (tempfile::TempDir, Library) {
     let tmp = tempfile::tempdir().unwrap();
     let file = tmp.path().join("in.jwpub");
