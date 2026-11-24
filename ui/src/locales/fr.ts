@@ -205,6 +205,7 @@ export const fr: Record<string, string> = {
   "Merged 1 change": "1 modification fusionnée",
   "Merged {count} changes": "{count} modifications fusionnées",
   "Conflicts": "Conflits",
+  "Playlist": "Playlist",
   "1 conflict, your version was kept:": "1 conflit, votre version a été gardée :",
   "{count} conflicts, your version was kept:": "{count} conflits, votre version a été gardée :",
   "Backups are .jwlibrary files with favorites, highlights, notes, tags and bookmarks.": "Les sauvegardes sont des fichiers .jwlibrary contenant favoris, surlignages, notes, étiquettes et signets.",

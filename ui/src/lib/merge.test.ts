@@ -45,6 +45,13 @@ describe("conflictText", () => {
     expect(lines[10]).toBe("Note: Title 9");
     expect(lines[11]).toBe("… and 2 more");
   });
+  it("names a conflicting playlist once", () => {
+    const text = conflictText([{ table: "Playlist", guid: "Songs", summary: "Playlist Songs" }]);
+    expect(text).toBe("1 conflict, your version was kept:\nPlaylist: Songs");
+  });
+  it("keeps a playlist summary without the prefix as it is", () => {
+    expect(conflictText([{ table: "Playlist", guid: "x", summary: "Lieder" }]).split("\n")[1]).toBe("Playlist: Lieder");
+  });
   it("shows exactly ten without a tail", () => {
     expect(conflictText(conflicts(10)).split("\n")).toHaveLength(11);
   });

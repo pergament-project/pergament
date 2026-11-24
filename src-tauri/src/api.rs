@@ -13,6 +13,9 @@ use pergament::links::{Link, MediaKind, MediaRef};
 use pergament::mediator;
 use pergament::navigate::{self, Page, Target, TargetKind};
 use pergament::note_markdown;
+use pergament::playlist::{
+    ItemKind, ItemSource, LibraryRef, Playlist, PlaylistItemInfo, TICKS_PER_SECOND,
+};
 use pergament::reader::{BibleBook, TocNode};
 use pergament::render::{RenderOptions, Renderer, media_name};
 use pergament::search::{SearchRequest, SearchResponse, SearchStatus};
@@ -1281,6 +1284,151 @@ pub fn media_file(library: &Library, publications_root: &Path, path: &str) -> Op
     full.is_file().then_some(full)
 }
 
+/// A playlist for the frontend: [`Playlist`] with the catalog language code
+/// of each library item, so it can be played through `media_links`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistView {
+    pub id: i64,
+    pub name: String,
+    pub items: Vec<PlaylistItemView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistItemView {
+    pub id: i64,
+    pub label: String,
+    pub kind: ItemKind,
+    pub duration_ticks: i64,
+    pub start_trim_ticks: Option<i64>,
+    pub end_trim_ticks: Option<i64>,
+    pub end_action: i64,
+    pub thumbnail: Option<PathBuf>,
+    pub source: SourceView,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum SourceView {
+    #[serde(rename_all = "camelCase")]
+    Library {
+        key_symbol: String,
+        track: i64,
+        issue_tag: i64,
+        meps_language: i64,
+        kind: ItemKind,
+        /// `None` when the catalog does not know the language, or there is no catalog.
+        lang_code: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    File {
+        path: PathBuf,
+        mime: String,
+        available: bool,
+    },
+}
+
+pub fn playlist_view(playlist: Playlist, catalog: Option<&Catalog>) -> PlaylistView {
+    let items = playlist
+        .items
+        .into_iter()
+        .map(|item: PlaylistItemInfo| PlaylistItemView {
+            id: item.id,
+            label: item.label,
+            kind: item.kind,
+            duration_ticks: item.duration_ticks,
+            start_trim_ticks: item.start_trim_ticks,
+            end_trim_ticks: item.end_trim_ticks,
+            end_action: item.end_action,
+            thumbnail: item.thumbnail,
+            source: match item.source {
+                ItemSource::Library {
+                    key_symbol,
+                    track,
+                    issue_tag,
+                    meps_language,
+                    kind,
+                } => SourceView::Library {
+                    key_symbol,
+                    track,
+                    issue_tag,
+                    meps_language,
+                    kind,
+                    lang_code: catalog
+                        .and_then(|c| c.language_code(meps_language))
+                        .map(str::to_owned),
+                },
+                ItemSource::File {
+                    path,
+                    mime,
+                    available,
+                } => SourceView::File {
+                    path,
+                    mime,
+                    available,
+                },
+            },
+        })
+        .collect();
+    PlaylistView {
+        id: playlist.id,
+        name: playlist.name,
+        items,
+    }
+}
+
+/// The playlist form of a linked recording: the issue `YYYYMM` becomes the
+/// `IssueTagNumber` `YYYYMM00`, an issue `YYYYMMDD` is taken as it is, no
+/// issue 0.
+pub fn library_ref(catalog: &Catalog, media: &MediaRef) -> ApiResult<LibraryRef> {
+    let meps_language = catalog
+        .meps_language(&media.lang_code)
+        .ok_or_else(|| format!("unknown language code {:?}", media.lang_code))?;
+    let issue_tag = match media.issue.as_deref() {
+        None => 0,
+        Some(issue) => match (issue.len(), issue.parse::<i64>()) {
+            (6, Ok(n)) if issue.bytes().all(|b| b.is_ascii_digit()) => n * 100,
+            (8, Ok(n)) if issue.bytes().all(|b| b.is_ascii_digit()) => n,
+            _ => return Err(format!("bad issue {issue:?}")),
+        },
+    };
+    Ok(LibraryRef {
+        key_symbol: media.pub_symbol.clone(),
+        track: i64::from(media.track),
+        issue_tag,
+        meps_language,
+        kind: match media.kind {
+            MediaKind::Audio => ItemKind::Audio,
+            MediaKind::Video => ItemKind::Video,
+        },
+    })
+}
+
+/// Seconds as playlist ticks, rounded; no duration is 0. Durations that are
+/// not finite, negative or beyond `i64` ticks are errors.
+pub fn ticks(seconds: Option<f64>) -> ApiResult<i64> {
+    let Some(s) = seconds else { return Ok(0) };
+    let t = (s * TICKS_PER_SECOND as f64).round();
+    // `i64::MAX as f64` is 2^63, one past the largest tick count.
+    if !t.is_finite() || t < 0.0 || t >= i64::MAX as f64 {
+        return Err(format!("bad duration {s}"));
+    }
+    Ok(t as i64)
+}
+
+/// The origin of a page, as the `Access-Control-Allow-Origin` value: like
+/// tauri's asset protocol, `scheme://host[:port]`, or `null` without a host.
+pub fn url_origin(url: &tauri::Url) -> String {
+    match url.host_str() {
+        Some(host) if url.scheme() != "data" => {
+            let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+            format!("{}://{host}{port}", url.scheme())
+        }
+        _ => "null".into(),
+    }
+}
+
 pub fn mime_for(path: &Path) -> &'static str {
     match path
         .extension()
@@ -1982,6 +2130,122 @@ mod tests {
             markdown_for(&lib, &user, &edited).unwrap(),
             "**Anchored**\n\n— Stored Title\n\nnew text\n"
         );
+    }
+
+    fn library_item(id: i64, meps_language: i64) -> PlaylistItemInfo {
+        PlaylistItemInfo {
+            id,
+            label: format!("Song {id}"),
+            kind: ItemKind::Audio,
+            duration_ticks: 0,
+            start_trim_ticks: None,
+            end_trim_ticks: None,
+            end_action: 0,
+            thumbnail: None,
+            source: ItemSource::Library {
+                key_symbol: "sjjm".into(),
+                track: id,
+                issue_tag: 0,
+                meps_language,
+                kind: ItemKind::Audio,
+            },
+        }
+    }
+
+    #[test]
+    fn playlist_view_adds_the_language_code_of_library_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = catalog(dir.path());
+        let mut file = library_item(3, 0);
+        file.kind = ItemKind::Image;
+        file.source = ItemSource::File {
+            path: "/m/A.jpg".into(),
+            mime: "image/jpeg".into(),
+            available: true,
+        };
+        let list = Playlist {
+            id: 7,
+            name: "Songs".into(),
+            items: vec![library_item(1, 2), library_item(2, 77), file],
+        };
+        let json = serde_json::to_value(playlist_view(list.clone(), Some(&cat))).unwrap();
+        assert_eq!(json["id"], 7);
+        assert_eq!(json["name"], "Songs");
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(items[0]["source"]["type"], "library");
+        assert_eq!(items[0]["source"]["keySymbol"], "sjjm");
+        assert_eq!(items[0]["source"]["mepsLanguage"], 2);
+        assert_eq!(items[0]["source"]["langCode"], "X");
+        assert_eq!(items[0]["durationTicks"], 0);
+        assert!(items[1]["source"]["langCode"].is_null());
+        assert_eq!(items[2]["source"]["type"], "file");
+        assert_eq!(items[2]["source"]["path"], "/m/A.jpg");
+        assert!(items[2]["source"].get("langCode").is_none());
+        // Without a catalog no code is known.
+        let json = serde_json::to_value(playlist_view(list, None)).unwrap();
+        assert!(json["items"][0]["source"]["langCode"].is_null());
+    }
+
+    #[test]
+    fn media_refs_become_library_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        let cat = catalog(dir.path());
+        let media = |issue: Option<&str>, lang: &str| MediaRef {
+            pub_symbol: "mwbv".into(),
+            issue: issue.map(str::to_owned),
+            track: 4,
+            kind: MediaKind::Video,
+            lang_code: lang.into(),
+        };
+        let r = library_ref(&cat, &media(Some("202609"), "x")).unwrap();
+        assert_eq!(
+            r,
+            LibraryRef {
+                key_symbol: "mwbv".into(),
+                track: 4,
+                issue_tag: 20260900,
+                meps_language: 2,
+                kind: ItemKind::Video,
+            }
+        );
+        assert_eq!(
+            library_ref(&cat, &media(Some("20260915"), "E"))
+                .unwrap()
+                .issue_tag,
+            20260915
+        );
+        assert!(library_ref(&cat, &media(Some("2026091a"), "X")).is_err());
+        assert!(library_ref(&cat, &media(Some("2026091"), "X")).is_err());
+        assert_eq!(library_ref(&cat, &media(None, "E")).unwrap().issue_tag, 0);
+        assert!(library_ref(&cat, &media(None, "ZZZ")).is_err());
+        assert!(library_ref(&cat, &media(Some("2026"), "X")).is_err());
+        assert!(library_ref(&cat, &media(Some("20260a"), "X")).is_err());
+    }
+
+    #[test]
+    fn seconds_become_ticks() {
+        assert_eq!(ticks(None), Ok(0));
+        assert_eq!(ticks(Some(1.5)), Ok(15_000_000));
+        assert_eq!(ticks(Some(0.0)), Ok(0));
+        // Rounded to the nearest tick, not truncated.
+        assert_eq!(ticks(Some(0.000_000_06)), Ok(1));
+        assert_eq!(ticks(Some(2.000_000_04)), Ok(20_000_000));
+        assert!(ticks(Some(-1.0)).is_err());
+        assert!(ticks(Some(1e300)).is_err());
+        assert!(ticks(Some(f64::NAN)).is_err());
+        assert!(ticks(Some(f64::INFINITY)).is_err());
+    }
+
+    #[test]
+    fn origins_of_urls() {
+        let origin = |u: &str| url_origin(&tauri::Url::parse(u).unwrap());
+        assert_eq!(
+            origin("http://localhost:1420/index.html"),
+            "http://localhost:1420"
+        );
+        assert_eq!(origin("tauri://localhost/"), "tauri://localhost");
+        assert_eq!(origin("http://tauri.localhost/x"), "http://tauri.localhost");
+        assert_eq!(origin("data:text/html,x"), "null");
     }
 
     #[test]

@@ -11,10 +11,19 @@ export function mergeToast(r: MergeReport): string {
   return text + (r.device ? t(" from {device}", { device: r.device }) : "");
 }
 
+/** One conflict as a line. Playlists get a translated label; their summary repeats the English table name. */
+function conflictLine(x: Conflict): string {
+  if (x.table === "Playlist") {
+    const name = x.summary.startsWith("Playlist ") ? x.summary.slice("Playlist ".length) : x.summary;
+    return name ? `${t("Playlist")}: ${name}` : t("Playlist");
+  }
+  return x.summary ? `${x.table}: ${x.summary}` : x.table;
+}
+
 /** The conflicts as lines of text, at most ten of them. The guid is an internal key and never shown. */
 export function conflictText(c: Conflict[]): string {
   const head = c.length === 1 ? t("1 conflict, your version was kept:") : t("{count} conflicts, your version was kept:", { count: c.length });
-  const lines = c.slice(0, MAX_CONFLICTS).map((x) => (x.summary ? `${x.table}: ${x.summary}` : x.table));
+  const lines = c.slice(0, MAX_CONFLICTS).map(conflictLine);
   const rest = c.length - MAX_CONFLICTS;
   if (rest > 0) lines.push(t("… and {count} more", { count: rest }));
   return [head, ...lines].join("\n");

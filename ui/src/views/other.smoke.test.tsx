@@ -328,7 +328,7 @@ describe("Personal Study", () => {
   });
 
   it("narrows the notes by text and highlight color and changes their order", async () => {
-    backend.user_data_summary = () => ({ marks: 0, notes: 2, tags: 0, bookmarks: 0, device: null });
+    backend.user_data_summary = () => ({ marks: 0, notes: 2, tags: 0, bookmarks: 0, playlists: 0, device: null });
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [note("a", "Dusk visits", 1, "2026-10-03T00:00:00Z"), note("b", "Patient listening", 3, "2026-10-05T00:00:00Z")];
@@ -349,7 +349,7 @@ describe("Personal Study", () => {
   });
 
   it("shows a note's Markdown formatted, with links only underlined", async () => {
-    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, device: null });
+    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, playlists: 0, device: null });
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [
@@ -367,7 +367,7 @@ describe("Personal Study", () => {
   });
 
   it("copies a note as Markdown", async () => {
-    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, device: null });
+    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, playlists: 0, device: null });
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [note("a", "T", null, "2026-10-03T00:00:00Z")];
@@ -479,7 +479,7 @@ describe("Note in the study pane", () => {
 
   it("writes a new note on Personal Study and saves it without a page", async () => {
     backend.save_note = () => "n1";
-    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null });
+    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, playlists: 0, device: null });
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [];
@@ -495,7 +495,7 @@ describe("Note in the study pane", () => {
   });
 
   it("opens an empty note on Personal Study when asked from elsewhere", async () => {
-    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null });
+    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, playlists: 0, device: null });
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [];
@@ -516,7 +516,7 @@ describe("Note in the study pane", () => {
   it("opens notes in the note window when the setting asks for it", async () => {
     localStorage.setItem("noteOpen", "window");
     backend.open_note_window = () => undefined;
-    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null });
+    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, playlists: 0, device: null });
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [];
@@ -529,7 +529,7 @@ describe("Note in the study pane", () => {
   });
 
   it("edits a note without a page in place on Personal Study", async () => {
-    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, device: null });
+    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, playlists: 0, device: null });
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [
@@ -987,9 +987,9 @@ describe("Merging backups", () => {
     vi.mocked(ask).mockReset();
     vi.mocked(open).mockReset();
   });
-  const restoreSummary = { marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null };
+  const restoreSummary = { marks: 0, notes: 0, tags: 0, bookmarks: 0, playlists: 0, device: null };
   const emptyUser = () => {
-    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, device: null });
+    backend.user_data_summary = () => ({ marks: 0, notes: 0, tags: 0, bookmarks: 0, playlists: 0, device: null });
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [];
@@ -1217,7 +1217,7 @@ describe("Coming back to a page", () => {
   });
 
   it("shows the notes of Personal Study right away", async () => {
-    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, device: null });
+    backend.user_data_summary = () => ({ marks: 0, notes: 1, tags: 0, bookmarks: 0, playlists: 0, device: null });
     backend.tags = () => [];
     backend.bookmarks = () => [];
     backend.all_notes = () => [

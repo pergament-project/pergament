@@ -220,6 +220,7 @@ export const ptBR: Record<string, string> = {
   "Merged 1 change": "1 alteração mesclada",
   "Merged {count} changes": "{count} alterações mescladas",
   "Conflicts": "Conflitos",
+  "Playlist": "Lista de reprodução",
   "1 conflict, your version was kept:": "1 conflito; a sua versão foi mantida:",
   "{count} conflicts, your version was kept:": "{count} conflitos; a sua versão foi mantida:",
   "Backups are .jwlibrary files with favorites, highlights, notes, tags and bookmarks.": "Backups são arquivos .jwlibrary com favoritos, destaques, notas, etiquetas e marcadores.",

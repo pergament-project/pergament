@@ -399,7 +399,58 @@ export interface UserDataSummary {
   notes: number;
   tags: number;
   bookmarks: number;
+  playlists: number;
   device: string | null;
+}
+
+export type PlaylistItemKind = "audio" | "video" | "image";
+
+/** A playlist in the list of playlists (`pergament::playlist::PlaylistSummary`). */
+export interface PlaylistSummary {
+  id: number;
+  name: string;
+  items: number;
+  durationTicks: number;
+  /** Path of the first item's thumbnail. */
+  thumbnail: string | null;
+}
+
+/** Where an item's media comes from; `langCode` is null when no cached catalog knows the language. */
+export type PlaylistItemSource =
+  | {
+      type: "library";
+      keySymbol: string;
+      track: number;
+      issueTag: number;
+      mepsLanguage: number;
+      kind: PlaylistItemKind;
+      langCode: string | null;
+    }
+  | { type: "file"; path: string; mime: string; available: boolean };
+
+/** One item of a playlist (`api::PlaylistItemView`). Durations are in ticks of 100 ns. */
+export interface PlaylistItemInfo {
+  id: number;
+  label: string;
+  kind: PlaylistItemKind;
+  durationTicks: number;
+  startTrimTicks: number | null;
+  endTrimTicks: number | null;
+  endAction: number;
+  thumbnail: string | null;
+  source: PlaylistItemSource;
+}
+
+export interface Playlist {
+  id: number;
+  name: string;
+  items: PlaylistItemInfo[];
+}
+
+/** Ids of the added items, and file names of the files that could not be added. */
+export interface AddedFiles {
+  added: number[];
+  skipped: string[];
 }
 
 export interface PageUserData {
@@ -555,6 +606,25 @@ export const api = {
     invoke<string>("start_reading_plan", { planKey, startDate, readBefore }),
   setReadingDay: (guid: string, day: number, done: boolean) => invoke<void>("set_reading_day", { guid, day, done }),
   deleteReadingPlan: (guid: string) => invoke<void>("delete_reading_plan", { guid }),
+  playlists: () => invoke<PlaylistSummary[]>("playlists"),
+  playlist: (id: number) => invoke<Playlist>("playlist", { id }),
+  createPlaylist: (name: string) => invoke<number>("create_playlist", { name }),
+  renamePlaylist: (id: number, name: string) => invoke<void>("rename_playlist", { id, name }),
+  deletePlaylist: (id: number) => invoke<void>("delete_playlist", { id }),
+  removePlaylistItem: (item: number) => invoke<void>("remove_playlist_item", { item }),
+  movePlaylistItem: (playlist: number, item: number, position: number) =>
+    invoke<void>("move_playlist_item", { playlist, item, position }),
+  /** `duration` in seconds, null when unknown. */
+  addLibraryPlaylistItem: (playlist: number, media: MediaRef, label: string, duration: number | null) =>
+    invoke<number>("add_library_playlist_item", { playlist, media, label, duration }),
+  addFilePlaylistItems: (playlist: number, paths: string[]) =>
+    invoke<AddedFiles>("add_file_playlist_items", { playlist, paths }),
+  setPlaylistItemDuration: (item: number, seconds: number) =>
+    invoke<void>("set_playlist_item_duration", { item, seconds }),
+  setPlaylistItemThumbnail: (item: number, jpeg: Uint8Array) =>
+    invoke<void>("set_playlist_item_thumbnail", { item, jpeg: Array.from(jpeg) }),
+  importPlaylist: (path: string) => invoke<number>("import_playlist", { path }),
+  exportPlaylist: (id: number, path: string) => invoke<void>("export_playlist", { id, path }),
   tags: () => invoke<TagInfo[]>("tags"),
   bookmarks: () => invoke<Bookmark[]>("bookmarks"),
   publicationBookmarks: (dir: string) => invoke<Bookmark[]>("publication_bookmarks", { dir }),
