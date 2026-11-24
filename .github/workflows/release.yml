@@ -54,7 +54,7 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run build
-          cargo build --release --locked -p pergament -p pergament-app --features pergament-app/custom-protocol,pergament-app/gst-plugin
+          cargo build --release --locked -p pergament -p pergament-app -p gst-plugin-tauri --features pergament-app/custom-protocol,pergament-app/gst-plugin
 
       - name: Package the zip
         run: scripts/package.sh "${GITHUB_REF_NAME#v}"
@@ -111,7 +111,7 @@ jobs:
       - name: Build the command line tool and give the bundler its suffixed copy
         run: |
           bun install --frozen-lockfile
-          cargo build --release --locked -p pergament -p pergament-app --features pergament-app/gst-plugin
+          cargo build --release --locked -p pergament -p pergament-app -p gst-plugin-tauri --features pergament-app/gst-plugin
           cp target/release/pergament target/release/pergament-x86_64-unknown-linux-gnu
 
       # The AppImage plugin of linuxdeploy embeds this, so AppImageUpdate finds
@@ -192,7 +192,7 @@ jobs:
         run: |
           bun install --frozen-lockfile
           bun run build
-          cargo build --release --locked -p pergament -p pergament-app --features pergament-app/custom-protocol,pergament-app/gst-plugin
+          cargo build --release --locked -p pergament -p pergament-app -p gst-plugin-tauri --features pergament-app/custom-protocol,pergament-app/gst-plugin
 
       - name: Install the GNOME runtime and SDK
         run: |

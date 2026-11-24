@@ -29,7 +29,7 @@ elif ls $plugin_real 1> /dev/null 2>&1; then
     cp $(ls $plugin_real | head -1) $plugin_src
 else
     echo "package: gst-plugin-tauri not found, building with gst-plugin feature..."
-    cargo build --release -p pergament-app --features gst-plugin 2>&1 | tail -5
+    cargo build --release --locked -p pergament-app -p gst-plugin-tauri --features pergament-app/gst-plugin 2>&1 | tail -5
     if ls $plugin_real 1> /dev/null 2>&1; then
         cp $(ls $plugin_real | head -1) $plugin_src
     else
