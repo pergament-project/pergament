@@ -499,14 +499,20 @@ playlist media entries; restore's media copying is not used for them.
 [own]
 
 - A snapshot holds every highlight (with its ranges), note, user tag,
-  bookmark, answer field, note or location `TagMap` row, reading plan and
-  ticked day under a key that does not depend on database ids, with a hash
-  of its content. The keys are the merge's: `UserMarkGuid`, note `Guid`,
+  bookmark, answer field, note or location `TagMap` row, reading plan,
+  ticked day and playlist under a key that does not depend on database
+  ids, with a hash of its content. The keys are the merge's: `UserMarkGuid`, note `Guid`,
   tag (`Type`, `Name`), bookmark publication location and `Slot`, answer
   page (without its language) and `TextTag`, for a `TagMap` row its tag and
   its note `Guid` or location, for a reading plan its `PlanKey` (hash: its
-  `StartDate`) and for a ticked day its plan's `PlanKey` and `Day` (a
-  constant hash).
+  `StartDate`), for a ticked day its plan's `PlanKey` and `Day` (a
+  constant hash) and for a playlist (`Tag` of `Type` 2) its `Name`. A
+  playlist is one row with all its items: its hash covers what the manual
+  merge compares (each item's label, trims, end action, markers, library
+  location or media `FilePath` and hash, thumbnail, in position order), not
+  the media files themselves. Its items' `TagMap` rows have no keys of their
+  own. A database without the playlist tables has no playlist keys, so a
+  base from before playlists were synced only adds them.
   Locations are compared normalized as above, so the same row has the same
   key and hash in every database. The database-wide `LastModified` and a
   note's `LastModified` are not part of the hash.
@@ -533,8 +539,8 @@ playlist media entries; restore's media copying is not used for them.
 - A row changed differently on both sides, or new on both sides with
   different content (e.g. the same bookmark slot), is settled the same way
   on every computer: a note by its own `LastModified`, the later one kept; a row
-  without a clock of its own (highlight, bookmark, answer, tag), or a note
-  changed at the same time, by its snapshot hash, the version with the
+  without a clock of its own (highlight, bookmark, answer, tag, playlist),
+  or a note changed at the same time, by its snapshot hash, the version with the
   greater hash (compared as text) kept. The database-wide `LastModified`
   is not used, as each computer would see itself as newer and keep its own
   version for good. The row is reported as a conflict.
@@ -552,6 +558,9 @@ playlist media entries; restore's media copying is not used for them.
   the plan was restarted here can survive). Start dates changed on both
   sides settle by the earlier start, as in a manual merge, and are
   reported. An untick is the deletion of a ticked day.
+- A playlist changed on one side only is taken as it is: the manual
+  merge's rule that keeps local file items the incoming version lacks does
+  not apply, so an item removed on one computer is removed on the other.
 - The order of a tag's notes is not merged. A `TagMap` row's hash is its
   rank in the tag, but the merge only asks whether the row is there, so
   moving a note within a tag is neither a change nor a conflict, and two
@@ -561,7 +570,11 @@ playlist media entries; restore's media copying is not used for them.
   note's `TagMap` rows go with the note; a tag is deleted only when no
   `TagMap` row refers to it any more, otherwise it is kept and reported; an
   answer is deleted from every location of its page, as in the editor; a
-  reading plan's ticked days go with the plan. A
+  reading plan's ticked days go with the plan; a playlist's items go with
+  the playlist. `IndependentMedia` rows no item uses any more are deleted
+  once, after the playlists are merged (an incoming playlist, e.g. one
+  renamed there, may use the media of a deleted one), still in the
+  transaction; their files only after it commits. A
   deleted row is missing from the incoming file by definition, so the merge
   that follows never adds it back or updates it.
 - Should two rows of one database share a key (e.g. two `Location` rows
@@ -576,9 +589,9 @@ playlist media entries; restore's media copying is not used for them.
 - Without a base (the first merge of a computer's file), the merge is a
   manual merge: nothing is deleted.
 - The deletions are checked for each kind of row apart: highlights and
-  notes, answers, bookmarks, tags with their `TagMap` rows, and reading
-  plans with their ticked days. When in any kind they are more than half of
-  the local rows of that kind and more than 5 rows, the merge stops before
+  notes, answers, bookmarks, tags with their `TagMap` rows, reading plans
+  with their ticked days, and playlists. When in any kind they are more
+  than half of the local rows of that kind and more than 5 rows, the merge stops before
   writing anything, including the safety copy, and asks, giving the
   deletions and local rows summed over all kinds. "Apply deletions" runs it
   as computed, after a rolling backup of the local data (written even when
@@ -590,8 +603,8 @@ playlist media entries; restore's media copying is not used for them.
   computer's own file now holds them unchanged against its base on the other
   side. To recover them on the other computer, restore a backup there.
 - A computer whose synced rows are all gone (no highlight, note, user tag,
-  bookmark, answer or reading plan) while its bases still hold rows lost or
-  reset its database. It is treated as new: before merging, it drops its
+  bookmark, answer, reading plan or playlist) while its bases still hold
+  rows lost or reset its database. It is treated as new: before merging, it drops its
   bases and its sync state, so every merge only adds. Empty bases (two
   empty computers) do not count, so nothing is merged again and again.
 - A computer never writes its own file while it has no synced rows: another

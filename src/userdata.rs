@@ -2264,9 +2264,9 @@ impl UserData {
         // the merge below never adds them back or updates them, and an
         // incoming highlight equal to a deleted one is added, not matched
         // to the row about to go.
-        let deleted = match sync {
+        let (deleted, playlists_deleted) = match sync {
             Some(sync) => delete_synced(&tx, sync, &mut report)?,
-            None => 0,
+            None => (0, false),
         };
         let locations = merge_locations(&tx)?;
         let marks = merge_marks(&tx, &locations, incoming_newer, sync, &mut report)?;
@@ -2279,7 +2279,15 @@ impl UserData {
         merge_location_tags(&tx, &locations, &tags, sync, &mut report)?;
         merge_bookmarks(&tx, &locations, incoming_newer, sync, &mut report)?;
         merge_reading_plans(&tx, sync, &mut report)?;
-        let orphans = merge_playlists(&tx, &locations, incoming_newer, sync, &mut report)?;
+        let replaced = merge_playlists(&tx, &locations, incoming_newer, sync, &mut report)?;
+        // One sweep once every playlist is merged: media a deleted playlist
+        // left may be used again by an incoming one. The files go after the
+        // commit.
+        let orphans = if playlists_deleted || replaced {
+            remove_orphan_media(&tx)?
+        } else {
+            Vec::new()
+        };
         if report.added + report.updated + deleted > 0 {
             take_later_clock(&tx)?;
         }
@@ -2338,7 +2346,7 @@ fn attach(conn: &Connection, path: &Path, schema: &str) -> Result<()> {
 
 /// Tables a database needs for [`copy_playlist`] and
 /// [`crate::playlist::content`] to read its playlists.
-const PLAYLIST_TABLES: [&str; 7] = [
+pub(crate) const PLAYLIST_TABLES: [&str; 7] = [
     "IndependentMedia",
     "PlaylistItem",
     "PlaylistItemIndependentMediaMap",
@@ -2662,20 +2670,30 @@ fn plan_of(sync: Option<&Resolver>, row: RowRef, local: Option<RowRef>) -> Optio
 
 /// Delete the local rows the other device deleted, through the editor's
 /// deletion paths, and report the rows kept because they changed here.
-/// Returns how many rows were deleted.
-fn delete_synced(tx: &Transaction<'_>, sync: &Resolver, report: &mut MergeReport) -> Result<i64> {
+/// Returns how many rows were deleted and whether a playlist was. Media a
+/// deleted playlist leaves unused is not removed here: an incoming playlist
+/// merged afterwards may use it again.
+fn delete_synced(
+    tx: &Transaction<'_>,
+    sync: &Resolver,
+    report: &mut MergeReport,
+) -> Result<(i64, bool)> {
     // Tag maps and ticked days first, then notes and highlights; tags last,
     // once nothing refers to them.
     let order = |key: &RowKey| match key {
         RowKey::TagMap(..) | RowKey::ReadingPlanDay(..) => 0,
         RowKey::Note(_) => 1,
         RowKey::Mark(_) => 2,
-        RowKey::Bookmark(..) | RowKey::InputField(..) | RowKey::ReadingPlan(_) => 3,
+        RowKey::Bookmark(..)
+        | RowKey::InputField(..)
+        | RowKey::ReadingPlan(_)
+        | RowKey::Playlist(_) => 3,
         RowKey::Tag(..) => 4,
     };
     let mut keys: Vec<&RowKey> = sync.classified.delete.iter().collect();
     keys.sort_by_key(|k| order(k));
     let mut deleted = 0;
+    let mut playlists = false;
     for key in keys {
         // Only the row the snapshot was read from: a second row with the
         // same key was never seen there.
@@ -2734,6 +2752,11 @@ fn delete_synced(tx: &Transaction<'_>, sync: &Resolver, report: &mut MergeReport
                     [id],
                 )?;
             }
+            // With its items, as the editor deletes a playlist.
+            RowRef::Playlist(id) => {
+                delete_playlist_rows(tx, *id)?;
+                playlists = true;
+            }
         }
         deleted += 1;
     }
@@ -2742,7 +2765,7 @@ fn delete_synced(tx: &Transaction<'_>, sync: &Resolver, report: &mut MergeReport
             report.conflicts.push(describe_local(tx, row)?);
         }
     }
-    Ok(deleted)
+    Ok((deleted, playlists))
 }
 
 /// A local row as a conflict: one deleted in the backup and kept here.
@@ -2811,6 +2834,13 @@ fn describe_local(tx: &Transaction<'_>, row: &RowRef) -> Result<Conflict> {
             )?;
             let summary = format!("Reading plan {key}, day {day}");
             conflict("ReadingPlanDay", &format!("{guid}:{day}"), summary)
+        }
+        RowRef::Playlist(id) => {
+            let name: String =
+                tx.query_row("SELECT Name FROM main.Tag WHERE TagId = ?1", [id], |r| {
+                    r.get(0)
+                })?;
+            conflict("Playlist", &name, format!("Playlist {name}"))
         }
     })
 }
@@ -3831,19 +3861,18 @@ fn merge_reading_plans(
 /// added; of two different versions the newer one wins (sync: its plan),
 /// else the local one stays and the other is listed. A manual merge that
 /// takes the incoming version keeps the local file items whose media the
-/// incoming version lacks, after the incoming items. Returns the
-/// `FilePath`s of the `IndependentMedia` rows no item uses any more, for
-/// the caller to remove once the transaction is committed.
+/// incoming version lacks, after the incoming items. Returns whether a
+/// local playlist was replaced, so media may have been left unused.
 fn merge_playlists(
     tx: &Transaction<'_>,
     locations: &HashMap<i64, i64>,
     incoming_newer: Option<bool>,
     sync: Option<&Resolver>,
     report: &mut MergeReport,
-) -> Result<Vec<String>> {
+) -> Result<bool> {
     for table in PLAYLIST_TABLES {
         if !has_table(tx, "inc", table)? {
-            return Ok(Vec::new());
+            return Ok(false);
         }
     }
     let incoming: Vec<(i64, String)> = {
@@ -3861,7 +3890,7 @@ fn merge_playlists(
                 |r| r.get(0),
             )
             .optional()?;
-        let plan = plan_of(sync, RowRef::Tag(id), local.map(RowRef::Tag));
+        let plan = plan_of(sync, RowRef::Playlist(id), local.map(RowRef::Playlist));
         let summary = || format!("Playlist {name}");
         let Some(local) = local else {
             if deleted_here(plan) {
@@ -3920,11 +3949,7 @@ fn merge_playlists(
                 .push(conflict("Playlist", &name, summary())),
         }
     }
-    if replaced {
-        remove_orphan_media(tx)
-    } else {
-        Ok(Vec::new())
-    }
+    Ok(replaced)
 }
 
 /// The items of local playlist `tag`, in position order.
@@ -8223,7 +8248,7 @@ mod tests {
         }
 
         /// `(OriginalFilename, FilePath, MimeType, Hash, DurationTicks)` of file item `item`.
-        fn media_of(ud: &UserData, item: i64) -> (String, String, String, String, i64) {
+        pub(super) fn media_of(ud: &UserData, item: i64) -> (String, String, String, String, i64) {
             ud.conn
                 .query_row(
                     "SELECT m.OriginalFilename, m.FilePath, m.MimeType, m.Hash, im.DurationTicks
@@ -9190,7 +9215,12 @@ mod tests {
 
         /// Append the own file `name` holding `bytes` to `tag`; returns the
         /// item and its `FilePath`.
-        fn own_file(ud: &mut UserData, tag: i64, name: &str, bytes: &[u8]) -> (i64, String) {
+        pub(super) fn own_file(
+            ud: &mut UserData,
+            tag: i64,
+            name: &str,
+            bytes: &[u8],
+        ) -> (i64, String) {
             let src = tempfile::tempdir().unwrap();
             let file = src.path().join(name);
             fs::write(&file, bytes).unwrap();
@@ -9199,14 +9229,14 @@ mod tests {
             (item, path)
         }
 
-        fn song_track(track: i64) -> LibraryRef {
+        pub(super) fn song_track(track: i64) -> LibraryRef {
             LibraryRef {
                 track,
                 ..song("sjjm", ItemKind::Audio)
             }
         }
 
-        fn labels(ud: &UserData, tag: i64) -> Vec<String> {
+        pub(super) fn labels(ud: &UserData, tag: i64) -> Vec<String> {
             ud.playlist(tag)
                 .unwrap()
                 .items
@@ -9215,7 +9245,7 @@ mod tests {
                 .collect()
         }
 
-        fn playlist_id(ud: &UserData, name: &str) -> i64 {
+        pub(super) fn playlist_id(ud: &UserData, name: &str) -> i64 {
             ud.playlists()
                 .unwrap()
                 .into_iter()
@@ -10586,6 +10616,174 @@ mod tests {
                 assert_eq!(mark_color(&a.ud, m), Some(4));
             }
             assert_eq!(a.ud.snapshot().unwrap(), r.snapshot);
+        }
+
+        use super::playlists::{labels, media_of, own_file, playlist_id, song_track};
+
+        fn has_playlist(ud: &UserData, name: &str) -> bool {
+            ud.playlists().unwrap().iter().any(|p| p.name == name)
+        }
+
+        #[test]
+        fn sync_takes_one_sided_change_exactly() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let tag = a.ud.create_playlist("Songs").unwrap();
+            a.ud.add_library_item(tag, &song_track(1), "Song", 10)
+                .unwrap();
+            let (_, path) = own_file(&mut a.ud, tag, "V.mov", b"own video");
+            sync_both(&mut a, &mut b);
+            let there = playlist_id(&b.ud, "Songs");
+            assert_eq!(labels(&b.ud, there), ["Song", "V.mov"]);
+            // B removes V; A takes that as it is, without keeping V as an
+            // own file the way a manual merge would.
+            let video = b.ud.playlist(there).unwrap().items[1].id;
+            b.ud.remove_playlist_item(video).unwrap();
+            // A is the newer database: the manual merge would keep its
+            // version and list B's as a conflict.
+            set_db_time(&b.ud, "2026-01-01T10:00:00Z");
+            set_db_time(&a.ud, "2026-06-01T10:00:00Z");
+            let r = sync(&b, &mut a);
+            assert_eq!(r.report.updated, 1);
+            assert!(r.report.conflicts.is_empty(), "{:?}", r.report.conflicts);
+            assert_eq!(labels(&a.ud, tag), ["Song"]);
+            assert_eq!(count(&a.ud, "IndependentMedia"), 0);
+            assert!(!a.ud.playlist_media_dir().join(&path).exists());
+            assert_eq!(a.ud.snapshot().unwrap(), r.snapshot);
+            assert_foreign_keys_hold(&a.ud);
+        }
+
+        #[test]
+        fn sync_one_sided_delete() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let songs = a.ud.create_playlist("Songs").unwrap();
+            a.ud.add_library_item(songs, &song_track(1), "Song", 10)
+                .unwrap();
+            let (_, path) = own_file(&mut a.ud, songs, "V.mov", b"own video");
+            let videos = a.ud.create_playlist("Videos").unwrap();
+            sync_both(&mut a, &mut b);
+
+            // Deleted there: deleted here, with its items and media file.
+            let there = playlist_id(&b.ud, "Songs");
+            b.ud.delete_playlist(there).unwrap();
+            let r = sync(&b, &mut a);
+            assert_eq!(r.deleted, 1);
+            assert!(r.report.conflicts.is_empty(), "{:?}", r.report.conflicts);
+            assert!(!has_playlist(&a.ud, "Songs"));
+            assert!(has_playlist(&a.ud, "Videos"));
+            assert_eq!(count(&a.ud, "PlaylistItem"), 0);
+            assert_eq!(count(&a.ud, "IndependentMedia"), 0);
+            assert!(!a.ud.playlist_media_dir().join(&path).exists());
+            assert_foreign_keys_hold(&a.ud);
+
+            // Edited here and deleted there: kept and reported.
+            a.ud.add_library_item(videos, &song_track(2), "Video", 10)
+                .unwrap();
+            let there = playlist_id(&b.ud, "Videos");
+            b.ud.delete_playlist(there).unwrap();
+            let r = sync(&b, &mut a);
+            assert_eq!(r.deleted, 0);
+            assert_eq!(labels(&a.ud, videos), ["Video"]);
+            assert_eq!(
+                r.report.conflicts,
+                [Conflict {
+                    table: "Playlist".into(),
+                    guid: "Videos".into(),
+                    summary: "Playlist Videos".into(),
+                }]
+            );
+        }
+
+        #[test]
+        fn sync_two_sided_change_converges() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let here = a.ud.create_playlist("Songs").unwrap();
+            a.ud.add_library_item(here, &song_track(1), "Song 1", 10)
+                .unwrap();
+            sync_both(&mut a, &mut b);
+            let there = playlist_id(&b.ud, "Songs");
+            a.ud.add_library_item(here, &song_track(2), "Song 2", 10)
+                .unwrap();
+            b.ud.add_library_item(there, &song_track(3), "Song 3", 10)
+                .unwrap();
+            let key = crate::sync_snapshot::RowKey::Playlist("Songs".into());
+            let hash = |ud: &UserData| ud.snapshot().unwrap().0[&key].clone();
+            let (ha, hb) = (hash(&a.ud), hash(&b.ud));
+            assert_ne!(ha, hb);
+            // Each merges the other's file as it was before either merge.
+            let (from_a, from_b) = (sync_file(&a), sync_file(&b));
+            let to_b = merged(merge_file(&from_a, "a", &mut b, DeleteGuard::Check));
+            let to_a = merged(merge_file(&from_b, "b", &mut a, DeleteGuard::Check));
+            for r in [&to_a, &to_b] {
+                assert_eq!(conflict_guids(&r.report), ["Songs"], "{:?}", r.report);
+                assert_eq!(r.report.conflicts[0].table, "Playlist");
+            }
+            // The greater hash wins on both computers; only the loser's
+            // playlist is replaced.
+            let (winner, updated_a, updated_b) = if ha > hb {
+                (["Song 1", "Song 2"], 0, 1)
+            } else {
+                (["Song 1", "Song 3"], 1, 0)
+            };
+            assert_eq!(labels(&a.ud, here), winner);
+            assert_eq!(labels(&b.ud, there), winner);
+            assert_eq!(
+                (to_a.report.updated, to_b.report.updated),
+                (updated_a, updated_b)
+            );
+            assert_eq!(a.ud.snapshot().unwrap(), b.ud.snapshot().unwrap());
+        }
+
+        #[test]
+        fn sync_rename_keeps_media_file() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let songs = a.ud.create_playlist("Songs").unwrap();
+            let (_, path) = own_file(&mut a.ud, songs, "V.mov", b"own video");
+            sync_both(&mut a, &mut b);
+            // To A, a rename is "Songs" deleted and "Songs 2" added, both
+            // using V.
+            let there = playlist_id(&b.ud, "Songs");
+            b.ud.rename_playlist(there, "Songs 2").unwrap();
+            let r = sync(&b, &mut a);
+            assert_eq!((r.deleted, r.report.added), (1, 1));
+            assert!(!has_playlist(&a.ud, "Songs"));
+            let renamed = playlist_id(&a.ud, "Songs 2");
+            assert_eq!(labels(&a.ud, renamed), ["V.mov"]);
+            let item = a.ud.playlist(renamed).unwrap().items[0].id;
+            assert_eq!(media_of(&a.ud, item).1, path);
+            assert_eq!(count(&a.ud, "IndependentMedia"), 1);
+            assert_eq!(
+                fs::read(a.ud.playlist_media_dir().join(&path)).unwrap(),
+                b"own video"
+            );
+            assert_foreign_keys_hold(&a.ud);
+        }
+
+        #[test]
+        fn old_base_without_playlists_only_adds() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = (device(tmp.path(), "a"), device(tmp.path(), "b"));
+            let songs = a.ud.create_playlist("Songs").unwrap();
+            a.ud.add_library_item(songs, &song_track(1), "Song", 10)
+                .unwrap();
+            sync_both(&mut a, &mut b);
+            // A base from before playlists were synced.
+            a.bases
+                .get_mut("b")
+                .unwrap()
+                .0
+                .retain(|k, _| !matches!(k, crate::sync_snapshot::RowKey::Playlist(_)));
+            let there = playlist_id(&b.ud, "Songs");
+            b.ud.delete_playlist(there).unwrap();
+            b.ud.create_playlist("New").unwrap();
+            let r = sync(&b, &mut a);
+            assert_eq!((r.deleted, r.report.added), (0, 1));
+            assert!(r.report.conflicts.is_empty(), "{:?}", r.report.conflicts);
+            assert_eq!(labels(&a.ud, songs), ["Song"]);
+            assert!(has_playlist(&a.ud, "New"));
         }
     }
 }
