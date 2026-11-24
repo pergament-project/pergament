@@ -29,6 +29,7 @@ tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tempfile = "3.27.0"
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
+gst-plugin-tauri = { git = "https://github.com/tauri-apps/tauri-gstreamer-plugin", tag = "gst-plugin-tauri-v0.0.1", optional = true }
 
 [dev-dependencies]
 rusqlite = "0.40.2"
@@ -36,3 +37,5 @@ rusqlite = "0.40.2"
 [features]
 # Serve the bundled frontend instead of the dev server; `tauri build` turns it on.
 custom-protocol = ["tauri/custom-protocol"]
+# Include the GStreamer plugin for asset:// playback on Linux (deb, rpm, AppImage).
+gst-plugin = ["gst-plugin-tauri", "tauri/protocol-asset"]

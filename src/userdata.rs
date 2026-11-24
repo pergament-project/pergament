@@ -7904,16 +7904,6 @@ mod tests {
             id
         }
 
-        /// Song `track` of `sjjm` as a library item with `Location.Type` `kind`.
-        pub(super) fn labels(ud: &UserData, tag: i64) -> Vec<String> {
-            ud.playlist(tag)
-                .unwrap()
-                .items
-                .into_iter()
-                .map(|i| i.label)
-                .collect()
-        }
-
         fn library_item(ud: &UserData, tag: i64, position: i64, track: i64, kind: i64) -> i64 {
             let id = item(ud, tag, position, "Song", None);
             ud.conn

@@ -35,14 +35,18 @@
         "files": {
           "/usr/share/metainfo/io.github.v3rm1n.pergament.metainfo.xml": "io.github.v3rm1n.pergament.metainfo.xml",
           "/etc/apt/sources.list.d/pergament.sources": "../packaging/apt/pergament.sources",
-          "/etc/apt/keyrings/pergament.gpg": "../packaging/apt/pergament.gpg"
+          "/etc/apt/keyrings/pergament.gpg": "../packaging/apt/pergament.gpg",
+          "/usr/lib/x86_64-linux-gnu/gstreamer-1.0/libgsttauriasset.so": "../../target/release/libgsttauriasset.so"
         }
       },
       "rpm": {
         "depends": ["webkit2gtk4.1", "gtk3", "libsoup3", "openssl-libs", "sqlite-libs"],
         "recommends": ["gstreamer1-libav"],
         "desktopTemplate": "desktop.template",
-        "files": { "/usr/share/metainfo/io.github.v3rm1n.pergament.metainfo.xml": "io.github.v3rm1n.pergament.metainfo.xml" }
+        "files": {
+          "/usr/share/metainfo/io.github.v3rm1n.pergament.metainfo.xml": "io.github.v3rm1n.pergament.metainfo.xml",
+          "/usr/lib64/gstreamer-1.0/libgsttauriasset.so": "../../target/release/libgsttauriasset.so"
+        }
       },
       "appimage": { "bundleMediaFramework": true }
     }

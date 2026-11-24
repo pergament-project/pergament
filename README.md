@@ -112,8 +112,10 @@ Fedora); the packages above already include it.
 
 Videos and audio you add to a playlist from disk play only where GStreamer has
 the Tauri `asset://` plugin (`gst-plugin-tauri`). The Nix package includes it.
+The deb, rpm, AppImage and zip packages can include it by building with the
+`gst-plugin` feature: `cargo build --release --features gst-plugin -p pergament-app`.
 The app already lets WebKitGTK use the `asset` scheme (`WEBKIT_GST_ALLOWED_URI_PROTOCOLS`).
-On the other Linux packages, playlist photos work and these files are added
+On packages without the plugin, playlist photos work and these files are added
 and listed, but they may not play until that plugin is installed.
 
 **Mac (Apple Silicon):** open the `.dmg` and drag Pergament to Applications.

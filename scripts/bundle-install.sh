@@ -82,6 +82,11 @@ fi
 say "installing below $prefix"
 run install -Dm755 "$here/bin/pergament" "$prefix/bin/pergament"
 run install -Dm755 "$here/bin/pergament-app" "$prefix/bin/pergament-app"
+# Install gst-plugin-tauri for asset:// playback (playlist video/audio from disk)
+if [[ -f $here/lib/gstreamer-1.0/libgsttauriasset.so ]]; then
+    run install -Dm755 "$here/lib/gstreamer-1.0/libgsttauriasset.so" \
+        "$prefix/lib/gstreamer-1.0/libgsttauriasset.so"
+fi
 for size in 32 64 128 256 512; do
     run install -Dm644 "$here/share/icons/${size}x${size}.png" \
         "$prefix/share/icons/hicolor/${size}x${size}/apps/$app_id.png"
