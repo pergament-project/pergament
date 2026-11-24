@@ -19,11 +19,12 @@ export function SearchView() {
   const [indexVersion, setIndexVersion] = useState(0);
   const previousStatus = useRef<SearchStatus | null>(null);
 
+  // Only a new navigation brings in a query; reacting to `query` too would undo every edit.
   useEffect(() => {
-    if (view.name !== "search" || view.query === undefined || view.query === query) return;
+    if (view.name !== "search" || view.query === undefined) return;
     setOffset(0);
     setQuery(view.query);
-  }, [view, query]);
+  }, [view]);
 
   useEffect(() => {
     let current = true;

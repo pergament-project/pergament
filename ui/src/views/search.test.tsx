@@ -103,6 +103,17 @@ describe("SearchView", () => {
     expect((await screen.findByRole("searchbox", { name: "Search library" }) as HTMLInputElement).value).toBe("from palette");
   });
 
+  it("lets the user edit a query that came from the palette", async () => {
+    render(<AppProvider><SearchView /><SearchHandoff query="from palette" /></AppProvider>);
+    fireEvent.click(screen.getByRole("button", { name: "Use palette query" }));
+    const box = (await screen.findByRole("searchbox", { name: "Search library" })) as HTMLInputElement;
+    await waitFor(() => expect(box.value).toBe("from palette"));
+    fireEvent.change(box, { target: { value: "edited" } });
+    await waitFor(() => expect(box.value).toBe("edited"));
+    await new Promise((done) => setTimeout(done, 50));
+    expect(box.value).toBe("edited");
+  });
+
   it("reports incomplete coverage and lets the user request a rebuild", async () => {
     status = { state: "incomplete", total: 2, indexed: 1, failed: 1, unanchored: 0 };
     renderSearch();
