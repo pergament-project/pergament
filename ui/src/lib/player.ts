@@ -7,12 +7,16 @@ export interface PlayerSource {
   subtitles: string | null;
 }
 
-/** What the player shows: a recording and the qualities available for it. */
+/** What the player shows: a recording and the qualities available for it, or a picture. */
 export interface PlayerItem {
   title: string;
-  kind: "audio" | "video";
+  /** An image shows in the stage until Next is pressed; its URL is the first source. */
+  kind: "audio" | "video" | "image";
   poster: string | null;
   sources: PlayerSource[];
+  /** Where playback starts and stops, in seconds. */
+  start?: number;
+  end?: number;
 }
 
 export const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2];

@@ -171,9 +171,12 @@ interface AppContextValue {
   setFavorite: (key: PublicationKey, favorite: boolean) => Promise<void>;
   createBackup: () => Promise<void>;
   restoreBackup: () => Promise<void>;
-  /** The recording being played; it keeps playing while the user navigates. */
-  player: { id: number; item: PlayerItem } | null;
+  /** The recordings being played, and which one to start with; they keep playing while the user navigates. */
+  player: { id: number; items: PlayerItem[]; index: number } | null;
+  /** Play one recording: a queue of one. */
   playItem: (item: PlayerItem) => void;
+  /** Play the items in order from `index`, as "Play all" does. */
+  playQueue: (items: PlayerItem[], index: number) => void;
   /** Look up a recording that a publication links to and play it. */
   playRecording: (media: MediaRef) => Promise<void>;
   /** Open one of the app's own links, such as a Bible verse in a note, in the Bible chosen for the language. */
@@ -686,7 +689,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (!playerRef.current) sendDisplay({ type: "idle" });
   }, [sendDisplay]);
 
-  const playItem = useCallback((item: PlayerItem) => setPlayer({ id: Date.now(), item }), []);
+  const playQueue = useCallback(
+    (items: PlayerItem[], index: number) => {
+      // Nothing to play leaves the player as it is; an index out of range starts at the nearest end.
+      if (items.length === 0) return;
+      setPlayer({ id: Date.now(), items, index: Math.min(Math.max(0, Math.trunc(index) || 0), items.length - 1) });
+    },
+    [],
+  );
+  const playItem = useCallback((item: PlayerItem) => playQueue([item], 0), [playQueue]);
   const closePlayer = useCallback(() => setPlayer(null), []);
   /** Whether unsaved text in the editor may be dropped: true when there is none or the user agrees. */
   const mayDiscard = useCallback(async () => !noteDirty.current || (await askDiscard()), []);
@@ -999,6 +1010,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       restoreBackup,
       player,
       playItem,
+      playQueue,
       playRecording,
       openLink,
       setLinkHandler,
@@ -1056,6 +1068,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       restoreBackup,
       player,
       playItem,
+      playQueue,
       playRecording,
       openLink,
       setLinkHandler,

@@ -1690,3 +1690,21 @@ describe("export notes", () => {
     expect(await screen.findByText("Could not export notes: disk full")).toBeTruthy();
   });
 });
+
+describe("Player queue", () => {
+  it("ignores an empty queue and starts an index out of range at the nearest end", async () => {
+    const item = (title: string) => ({ title, kind: "audio" as const, poster: null, sources: [] });
+    let app!: ReturnType<typeof useApp>;
+    function Probe() {
+      app = useApp();
+      return null;
+    }
+    renderIn(<Probe />);
+    act(() => app.playQueue([], 0));
+    expect(app.player).toBeNull();
+    act(() => app.playQueue([item("A"), item("B")], 5));
+    expect(app.player?.index).toBe(1);
+    act(() => app.playQueue([item("A"), item("B")], -3));
+    expect(app.player?.index).toBe(0);
+  });
+});

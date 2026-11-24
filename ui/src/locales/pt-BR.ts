@@ -300,6 +300,7 @@ export const ptBR: Record<string, string> = {
   "Open in browser": "Abrir no navegador",
   "This recording is not available.": "Esta gravação não está disponível.",
   "This system cannot play the recording here. Open it in your browser instead.": "Este sistema não consegue reproduzir a gravação aqui. Abra-a no navegador.",
+  "This picture cannot be shown.": "Não é possível mostrar esta imagem.",
   // Video and audio
   "Video": "Vídeo",
   "Audio": "Áudio",
@@ -327,6 +328,8 @@ export const ptBR: Record<string, string> = {
   "Back 5 seconds": "Voltar 5 segundos",
   "Forward 15 seconds": "Avançar 15 segundos",
   "Restart": "Recomeçar",
+  "Previous": "Anterior",
+  "Next": "Próximo",
   "Mute": "Silenciar",
   "Unmute": "Ativar som",
   "Volume": "Volume",

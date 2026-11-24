@@ -300,6 +300,7 @@ export const de: Record<string, string> = {
   "Open in browser": "Im Browser öffnen",
   "This recording is not available.": "Diese Aufnahme ist nicht verfügbar.",
   "This system cannot play the recording here. Open it in your browser instead.": "Dieses System kann die Aufnahme hier nicht abspielen. Öffne sie stattdessen im Browser.",
+  "This picture cannot be shown.": "Dieses Bild kann nicht angezeigt werden.",
   // Video and audio
   "Video": "Video",
   "Audio": "Audio",
@@ -327,6 +328,8 @@ export const de: Record<string, string> = {
   "Back 5 seconds": "5 Sekunden zurück",
   "Forward 15 seconds": "15 Sekunden vor",
   "Restart": "Von vorn beginnen",
+  "Previous": "Zurück",
+  "Next": "Weiter",
   "Mute": "Stummschalten",
   "Unmute": "Ton einschalten",
   "Volume": "Lautstärke",

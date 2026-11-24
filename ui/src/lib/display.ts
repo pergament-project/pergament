@@ -26,7 +26,7 @@ export interface PlaybackState {
 export type DisplayMessage =
   /** The year text, on black. */
   | { type: "idle" }
-  | { type: "image"; /** `jwmedia:` URL */ src: string; caption: string }
+  | { type: "image"; /** `jwmedia:` URL, or an asset URL of a playlist photo (`convertFileSrc`) */ src: string; caption: string }
   | ({
       type: "media";
       url: string;

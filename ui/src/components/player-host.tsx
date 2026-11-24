@@ -14,6 +14,8 @@ import {
   RotateCw,
   Settings,
   SkipBack,
+  StepBack,
+  StepForward,
   Volume2,
   VolumeX,
   X,
@@ -46,9 +48,25 @@ const iconButton = "flex h-8 w-8 items-center justify-center rounded-md hover:bg
 const chip = "flex items-center gap-1 rounded-md px-2 py-1 hover:bg-bar aria-pressed:bg-bar aria-pressed:font-medium";
 const select = "h-8 min-w-28 px-2";
 
-function Control({ label, onClick, children }: { label: string; onClick: () => void; children: ReactNode }) {
+function Control({
+  label,
+  onClick,
+  disabled,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  children: ReactNode;
+}) {
   return (
-    <button aria-label={label} title={label} className={iconButton} onClick={onClick}>
+    <button
+      aria-label={label}
+      title={label}
+      className={cn(iconButton, "disabled:opacity-40")}
+      disabled={disabled}
+      onClick={onClick}
+    >
       {children}
     </button>
   );
@@ -59,20 +77,28 @@ function Control({ label, onClick, children }: { label: string; onClick: () => v
  * and keeps playing when the user navigates: minimised it is a bar at the
  * bottom, expanded it fills the content area. The `<video>` element stays
  * mounted when switching, so playback is not interrupted.
+ *
+ * It plays a queue: one item, or a whole playlist that moves on to the next
+ * item when one ends. A picture in the queue stays until Next is pressed.
  */
 export function PlayerHost() {
   const { player } = useApp();
-  return player ? <Player key={player.id} item={player.item} /> : null;
+  return player ? <Player key={player.id} items={player.items} first={player.index} /> : null;
 }
 
-function Player({ item }: { item: PlayerItem }) {
+/** The quality to start an item with. */
+const startSource = (item: PlayerItem) =>
+  loadAutoQuality() ? autoStart(item.sources, windowHeight()) : pickSource(item.sources, loadMediaQuality());
+
+function Player({ items, first }: { items: PlayerItem[]; first: number }) {
   const { lang, view, closePlayer, display, viewer } = useApp();
+  const [index, setIndex] = useState(first);
+  const item = items[index];
+  const picture = item.kind === "image";
   const [full, setFull] = useState(true);
   const [screen, setScreen] = useState(false);
   const [auto, setAuto] = useState(loadAutoQuality);
-  const [source, setSource] = useState<PlayerSource | undefined>(() =>
-    loadAutoQuality() ? autoStart(item.sources, windowHeight()) : pickSource(item.sources, loadMediaQuality()),
-  );
+  const [source, setSource] = useState<PlayerSource | undefined>(() => startSource(item));
   const [speed, setSpeed] = useState(1);
   const [repeat, setRepeat] = useState(false);
   const [captions, setCaptions] = useState(false);
@@ -92,6 +118,7 @@ function Player({ item }: { item: PlayerItem }) {
   const blocked = useRef(new Set<string>());
   const healthySince = useRef<number | null>(null);
   const poster = useImageUrl(item.poster);
+  const pictureUrl = useImageUrl(picture ? (source?.url ?? null) : null);
 
   // With a second display open, the recording plays there too and this window
   // is the remote control: its own sound is off so it is not heard twice. An
@@ -111,6 +138,7 @@ function Player({ item }: { item: PlayerItem }) {
   const sendState = () => display.send({ type: "media-state", ...playback() });
   useEffect(() => {
     if (!mirror || !source) return;
+    if (item.kind === "image") return display.send({ type: "image", src: source.url, caption: item.title });
     display.send({
       type: "media",
       url: source.url,
@@ -119,14 +147,14 @@ function Player({ item }: { item: PlayerItem }) {
       subtitles: source.subtitles,
       ...playback(),
     });
-    // A new display content: when it opens, or when the quality changes the file.
-  }, [mirror, source?.url]);
+    // A new display content: when it opens, when the quality changes the file, or for the next item.
+  }, [mirror, source?.url, index]);
   useEffect(() => {
     if (mirror) sendState();
   }, [speed, volume, muted, captions]);
   useEffect(() => {
     if (media.current) media.current.muted = mirror || muted;
-  }, [mirror, muted, source?.url]);
+  }, [mirror, muted, source?.url, index]);
   // Closing the player hands the display back to the year text.
   useEffect(
     () => () => {
@@ -213,8 +241,30 @@ function Player({ item }: { item: PlayerItem }) {
     setDuration(el.duration || 0);
     el.playbackRate = speed;
     if (resume.current > 0) el.currentTime = resume.current;
+    else if (item.start) el.currentTime = item.start;
     resume.current = 0;
     applyCaptions(captions);
+  };
+  /** Show another item of the queue, from its start and in its own quality. */
+  const goTo = (i: number) => {
+    if (i < 0 || i >= items.length || i === index) return;
+    resume.current = 0;
+    stalls.current = [];
+    blocked.current.clear();
+    healthySince.current = null;
+    setError(null);
+    setTime(0);
+    setDuration(0);
+    setIndex(i);
+    setSource(startSource(items[i]));
+  };
+  /** The item played to its end (or its end trim): repeat it, go on to the next one, or stop after the last. */
+  const finished = (el: HTMLVideoElement) => {
+    if (repeat) {
+      el.currentTime = item.start ?? 0;
+      void el.play().catch(() => undefined);
+    } else if (index < items.length - 1) goTo(index + 1);
+    else el.pause();
   };
   const switchTo = (s: PlayerSource) => {
     resume.current = media.current?.currentTime ?? 0;
@@ -276,6 +326,7 @@ function Player({ item }: { item: PlayerItem }) {
   };
   const toggleMute = () => setMuted((m) => !m);
   const onPlayError = () => setError(t("This system cannot play the recording here. Open it in your browser instead."));
+  const onPictureError = () => setError(t("This picture cannot be shown."));
   const remote = source?.url.startsWith("https://") ?? false;
   const label = `${remote ? t("Streaming") : t("Playing")} · ${item.title}`;
 
@@ -346,20 +397,22 @@ function Player({ item }: { item: PlayerItem }) {
 
   const controls = (
     <div className="relative shrink-0 border-t border-line bg-surface px-3 pb-2 pt-1">
-      <Slider
-        label={t("Position")}
-        min={0}
-        // A slider needs a range, so it waits for the length.
-        max={duration || 1}
-        disabled={!duration}
-        step={0.1}
-        value={[Math.min(time, duration || 0)]}
-        onValueChange={([v]) => {
-          setTime(v);
-          if (media.current) media.current.currentTime = v;
-        }}
-        className="w-full cursor-pointer"
-      />
+      {!picture && (
+        <Slider
+          label={t("Position")}
+          min={0}
+          // A slider needs a range, so it waits for the length.
+          max={duration || 1}
+          disabled={!duration}
+          step={0.1}
+          value={[Math.min(time, duration || 0)]}
+          onValueChange={([v]) => {
+            setTime(v);
+            if (media.current) media.current.currentTime = v;
+          }}
+          className="w-full cursor-pointer"
+        />
+      )}
       <div className="mt-1 flex items-center justify-between gap-3 text-[13px]">
         {full ? (
           <span className="flex min-w-0 items-center gap-2 text-muted">
@@ -376,9 +429,11 @@ function Player({ item }: { item: PlayerItem }) {
             <span className="truncate">{label}</span>
           </button>
         )}
-        <span className="shrink-0 tabular-nums text-muted">
-          {formatDuration(time)}/{formatDuration(duration)}
-        </span>
+        {!picture && (
+          <span className="shrink-0 tabular-nums text-muted">
+            {formatDuration(time)}/{formatDuration(duration)}
+          </span>
+        )}
       </div>
       {error && (
         <p role="alert" className="mt-1 truncate text-[13px] text-fg" title={error}>
@@ -386,39 +441,55 @@ function Player({ item }: { item: PlayerItem }) {
         </p>
       )}
       <div className="mt-1 flex items-center">
-        <Control label={paused ? t("Play") : t("Pause")} onClick={toggle}>
-          {paused ? <Play size={20} /> : <Pause size={20} />}
-        </Control>
-        <Control label={t("Back 5 seconds")} onClick={() => seekBy(-5)}>
-          <RotateCcw size={18} />
-        </Control>
-        <Control label={t("Forward 15 seconds")} onClick={() => seekBy(15)}>
-          <RotateCw size={18} />
-        </Control>
-        <Control label={t("Restart")} onClick={() => seekBy(-Infinity)}>
-          <SkipBack size={18} />
-        </Control>
-        <Control label={muted ? t("Unmute") : t("Mute")} onClick={toggleMute}>
-          {muted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
-        </Control>
-        <Slider
-          label={t("Volume")}
-          min={0}
-          max={1}
-          step={0.05}
-          value={[muted ? 0 : volume]}
-          onValueChange={([v]) => changeVolume(v)}
-          className="ml-1 hidden w-24 cursor-pointer sm:flex"
-        />
+        {items.length > 1 && (
+          <Control label={t("Previous")} onClick={() => goTo(index - 1)} disabled={index === 0}>
+            <StepBack size={18} />
+          </Control>
+        )}
+        {!picture && (
+          <>
+            <Control label={paused ? t("Play") : t("Pause")} onClick={toggle}>
+              {paused ? <Play size={20} /> : <Pause size={20} />}
+            </Control>
+            <Control label={t("Back 5 seconds")} onClick={() => seekBy(-5)}>
+              <RotateCcw size={18} />
+            </Control>
+            <Control label={t("Forward 15 seconds")} onClick={() => seekBy(15)}>
+              <RotateCw size={18} />
+            </Control>
+            <Control label={t("Restart")} onClick={() => seekBy(-Infinity)}>
+              <SkipBack size={18} />
+            </Control>
+            <Control label={muted ? t("Unmute") : t("Mute")} onClick={toggleMute}>
+              {muted || volume === 0 ? <VolumeX size={18} /> : <Volume2 size={18} />}
+            </Control>
+            <Slider
+              label={t("Volume")}
+              min={0}
+              max={1}
+              step={0.05}
+              value={[muted ? 0 : volume]}
+              onValueChange={([v]) => changeVolume(v)}
+              className="ml-1 hidden w-24 cursor-pointer sm:flex"
+            />
+          </>
+        )}
+        {items.length > 1 && (
+          <Control label={t("Next")} onClick={() => goTo(index + 1)} disabled={index === items.length - 1}>
+            <StepForward size={18} />
+          </Control>
+        )}
         <span className="ml-auto flex items-center">
-          <Popover open={menu} onOpenChange={setMenu}>
-            <PopoverTrigger asChild>
-              <button aria-label={t("Settings")} title={t("Settings")} className={cn(iconButton, menu && "bg-bar")}>
-                <Settings size={19} />
-              </button>
-            </PopoverTrigger>
-            {settings}
-          </Popover>
+          {!picture && (
+            <Popover open={menu} onOpenChange={setMenu}>
+              <PopoverTrigger asChild>
+                <button aria-label={t("Settings")} title={t("Settings")} className={cn(iconButton, menu && "bg-bar")}>
+                  <Settings size={19} />
+                </button>
+              </PopoverTrigger>
+              {settings}
+            </Popover>
+          )}
           {full ? (
             <Control label={screen ? t("Exit full screen") : t("Full screen")} onClick={toggleScreen}>
               {screen ? <Minimize size={19} /> : <Maximize size={19} />}
@@ -462,42 +533,56 @@ function Player({ item }: { item: PlayerItem }) {
         {item.kind === "audio" && poster && (
           <img src={poster} alt="" className="absolute max-h-[60%] max-w-[min(80%,420px)] object-contain" />
         )}
-        <video
-          key={source?.url}
-          ref={media}
-          src={source?.url}
-          poster={item.kind === "video" ? poster : undefined}
-          autoPlay
-          loop={repeat}
-          onClick={toggle}
-          onLoadedMetadata={onLoaded}
-          onTimeUpdate={(e) => {
-            setTime(e.currentTarget.currentTime);
-            checkBuffer(e.currentTarget);
-            // The display corrects itself when it drifts, so this need not be often.
-            if (mirror && Date.now() - lastSync.current > 2000) {
-              lastSync.current = Date.now();
-              sendState();
-            }
-          }}
-          onWaiting={(e) => onWaiting(e.currentTarget)}
-          onDurationChange={(e) => setDuration(e.currentTarget.duration || 0)}
-          onPlay={() => {
-            setPaused(false);
-            if (mirror) sendState();
-          }}
-          onPause={() => {
-            setPaused(true);
-            if (mirror) sendState();
-          }}
-          onSeeked={() => mirror && sendState()}
-          onError={onPlayError}
-          className={cn("h-full w-full bg-black object-contain", item.kind === "audio" && "opacity-0")}
-        >
-          {source?.subtitles && (
-            <track kind="subtitles" src={source.subtitles} srcLang={lang.toLowerCase()} label={t("Subtitles")} />
-          )}
-        </video>
+        {picture ? (
+          pictureUrl && (
+            <img
+              src={pictureUrl}
+              alt={item.title}
+              draggable={false}
+              onError={onPictureError}
+              className="max-h-full max-w-full object-contain"
+            />
+          )
+        ) : (
+          <video
+            key={`${index}:${source?.url}`}
+            ref={media}
+            src={source?.url}
+            poster={item.kind === "video" ? poster : undefined}
+            autoPlay
+            loop={repeat}
+            onClick={toggle}
+            onLoadedMetadata={onLoaded}
+            onEnded={(e) => finished(e.currentTarget)}
+            onTimeUpdate={(e) => {
+              setTime(e.currentTarget.currentTime);
+              if (item.end && e.currentTarget.currentTime >= item.end && !e.currentTarget.paused) finished(e.currentTarget);
+              checkBuffer(e.currentTarget);
+              // The display corrects itself when it drifts, so this need not be often.
+              if (mirror && Date.now() - lastSync.current > 2000) {
+                lastSync.current = Date.now();
+                sendState();
+              }
+            }}
+            onWaiting={(e) => onWaiting(e.currentTarget)}
+            onDurationChange={(e) => setDuration(e.currentTarget.duration || 0)}
+            onPlay={() => {
+              setPaused(false);
+              if (mirror) sendState();
+            }}
+            onPause={() => {
+              setPaused(true);
+              if (mirror) sendState();
+            }}
+            onSeeked={() => mirror && sendState()}
+            onError={onPlayError}
+            className={cn("h-full w-full bg-black object-contain", item.kind === "audio" && "opacity-0")}
+          >
+            {source?.subtitles && (
+              <track kind="subtitles" src={source.subtitles} srcLang={lang.toLowerCase()} label={t("Subtitles")} />
+            )}
+          </video>
+        )}
       </div>
       <div key="controls">{controls}</div>
     </div>

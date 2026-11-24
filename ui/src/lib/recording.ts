@@ -3,7 +3,7 @@ import { api, type Media, type MediaDownload, type MediaFile, type MediaRef } fr
 import type { PlayerItem } from "@/lib/player";
 import { t } from "@/lib/i18n";
 
-const sources = (files: MediaFile[]) =>
+export const sources = (files: MediaFile[]) =>
   files.map((f) => ({ label: f.label, url: f.url, size: f.size, subtitles: f.subtitles }));
 
 /** A catalog recording, streamed from jw.org. */
