@@ -324,7 +324,13 @@ fn register_functions(conn: &Connection) -> Result<()> {
         1,
         rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let s = ctx.get::<String>(0)?;
+            use rusqlite::types::{Value, ValueRef};
+            // NULL (no clock) and non-text values pass through unchanged, so
+            // `julianday` sees them as it did before this function.
+            let ValueRef::Text(text) = ctx.get_raw(0) else {
+                return ctx.get::<Value>(0);
+            };
+            let s = String::from_utf8_lossy(text).into_owned();
             let b = s.as_bytes();
             if b.len() >= 5 {
                 let offset = &b[b.len() - 5..];
@@ -338,10 +344,10 @@ fn register_functions(conn: &Connection) -> Result<()> {
                     out.push_str(&s[..s.len() - 2]);
                     out.push(':');
                     out.push_str(&s[s.len() - 2..]);
-                    return Ok(out);
+                    return Ok(Value::Text(out));
                 }
             }
-            Ok(s)
+            Ok(Value::Text(s))
         },
     )?;
     Ok(())
@@ -6788,6 +6794,30 @@ mod tests {
                 .unwrap();
             assert_eq!(normalized, expected);
         }
+
+        // Like `julianday`, NULL and other non-text values pass through, so a
+        // missing clock compares as unknown instead of failing the query.
+        let null: Option<String> = conn
+            .query_row("SELECT normalize_timestamp(NULL)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(null, None);
+        let number: f64 = conn
+            .query_row("SELECT normalize_timestamp(2461000.5)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(number, 2461000.5);
+    }
+
+    #[test]
+    fn merge_backup_without_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut ud = UserData::open(tmp.path().join("a").join(DB_NAME)).unwrap();
+        let remote = UserData::open(tmp.path().join("b").join(DB_NAME)).unwrap();
+        remote
+            .conn
+            .execute_batch("DELETE FROM LastModified")
+            .unwrap();
+        let backup = backup_of(&remote, tmp.path(), "b.jwlibrary");
+        ud.merge_backup(&backup).unwrap();
     }
 
     #[test]
