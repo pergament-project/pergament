@@ -1,8 +1,20 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Check, MoreHorizontal } from "lucide-react";
+import { Check, ListMusic, MoreHorizontal, Plus } from "lucide-react";
 import { useApp } from "@/app";
-import { api, samePublication, type PublicationKey, type CatalogEntry, type Language, type LanguageEntry, type PubCard } from "@/lib/api";
+import {
+  api,
+  samePublication,
+  type PublicationKey,
+  type CatalogEntry,
+  type Language,
+  type LanguageEntry,
+  type MediaRef,
+  type PlaylistSummary,
+  type PubCard,
+} from "@/lib/api";
 import { loadLanguages } from "@/components/language-menu";
+import { NameDialog } from "@/components/playlists";
+import { Button } from "@/components/ui/button";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -15,6 +27,9 @@ import {
 import { Command, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { isMediaUrl, mediaBlobUrl } from "@/lib/media";
+import { parseMediaKey } from "@/lib/playlist";
+import { makeThumbnail } from "@/lib/thumbnail";
 import { mediaLink, publicationLink } from "@/lib/share";
 import { cn } from "@/lib/utils";
 import { t } from "@/lib/i18n";
@@ -31,6 +46,11 @@ export interface MediaTarget {
   kind: "media";
   key: string;
   langCode: string;
+  title: string;
+  /** Length in seconds, null when unknown. */
+  duration: number | null;
+  /** Cover image (`jwmedia:` or plain URL), null when there is none. */
+  image: string | null;
 }
 export type TileTarget = PubTarget | MediaTarget;
 
@@ -119,6 +139,112 @@ function LanguagePicker({ target, onClose }: { target: PubTarget; onClose: () =>
   );
 }
 
+/** Makes the playlist thumbnail of a new item from the recording's cover. Failures leave the item without one. */
+async function setThumbnail(item: number, image: string, done: () => void) {
+  try {
+    const url = isMediaUrl(image) ? await mediaBlobUrl(image) : image;
+    const jpeg = await makeThumbnail(url, "image");
+    if (!jpeg) return;
+    await api.setPlaylistItemThumbnail(item, jpeg);
+    done();
+  } catch {
+    // The item simply has no thumbnail.
+  }
+}
+
+/** Picks a playlist, or creates one, and adds the recording to it. */
+function AddToPlaylistDialog({ target, media, onClose }: { target: MediaTarget; media: MediaRef; onClose: () => void }) {
+  const { toast, playlistsChanged } = useApp();
+  const [playlists, setPlaylists] = useState<PlaylistSummary[] | null>(null);
+  const [query, setQuery] = useState("");
+  const [creating, setCreating] = useState(false);
+
+  useEffect(() => {
+    api
+      .playlists()
+      .then(setPlaylists)
+      .catch((e) => {
+        setPlaylists([]);
+        toast(String(e));
+      });
+  }, [toast]);
+
+  const shown = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return (playlists ?? []).filter((p) => !q || p.name.toLowerCase().includes(q));
+  }, [playlists, query]);
+
+  /** Adds the recording; throws after showing the error. */
+  const add = async (id: number, name: string) => {
+    try {
+      const item = await api.addLibraryPlaylistItem(id, media, target.title, target.duration);
+      toast(t("Added to {playlist}", { playlist: name }));
+      playlistsChanged();
+      if (target.image) void setThumbnail(item, target.image, playlistsChanged);
+    } catch (e) {
+      toast(String(e));
+      throw e;
+    }
+  };
+
+  const pick = (p: PlaylistSummary) => {
+    onClose();
+    void add(p.id, p.name).catch(() => undefined);
+  };
+
+  const create = async (name: string) => {
+    let id: number;
+    try {
+      id = await api.createPlaylist(name);
+    } catch (e) {
+      toast(String(e));
+      throw e;
+    }
+    playlistsChanged();
+    onClose();
+    await add(id, name).catch(() => undefined);
+  };
+
+  if (creating) {
+    return (
+      <NameDialog
+        open
+        title={t("Create Playlist")}
+        existingNames={(playlists ?? []).map((p) => p.name)}
+        onClose={() => setCreating(false)}
+        onSubmit={create}
+      />
+    );
+  }
+
+  return (
+    <Dialog open onOpenChange={(o) => !o && onClose()}>
+      <DialogContent aria-describedby={undefined} className="max-h-[70vh] w-[min(90vw,360px)] gap-0 overflow-hidden p-0">
+        <DialogTitle className="px-4 pb-2 pt-4 text-base">{t("Add to Playlist")}</DialogTitle>
+        <div className="px-4 pb-2">
+          <Button variant="outline" size="sm" className="w-full" onClick={() => setCreating(true)}>
+            <Plus size={15} /> {t("Create Playlist")}
+          </Button>
+        </div>
+        <Command shouldFilter={false} label={t("Add to Playlist")}>
+          <CommandInput autoFocus value={query} onValueChange={setQuery} placeholder={t("Search playlists")} />
+          <CommandList className="pb-2">
+            {playlists === null && <div className="px-4 py-2 text-sm text-muted">{t("Loading…")}</div>}
+            {playlists?.length === 0 && <div className="px-4 py-2 text-sm text-muted">{t("No playlists yet")}</div>}
+            {shown.map((p) => (
+              <CommandItem key={p.id} value={String(p.id)} onSelect={() => pick(p)}>
+                <ListMusic size={15} />
+                <span className="min-w-0 flex-1 truncate">{p.name}</span>
+                <span className="text-xs text-muted">{t("{n} items", { n: p.items })}</span>
+              </CommandItem>
+            ))}
+          </CommandList>
+        </Command>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
 /** Asks before a downloaded publication is deleted. */
 function RemoveConfirm({ title, onConfirm, onClose }: { title: string; onConfirm: () => void; onClose: () => void }) {
   return (
@@ -154,6 +280,8 @@ export function TileMenu({
   const { toast, favorites, setFavorite, removePublication } = useApp();
   const [picking, setPicking] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const media = target.kind === "media" ? parseMediaKey(target.key) : null;
   const favorite = target.kind === "pub" && favorites.some((key) => samePublication(key, target));
 
   const share = async () => {
@@ -186,6 +314,7 @@ export function TileMenu({
         </DropdownMenuTrigger>
         <DropdownMenuContent align="end" className="min-w-[200px]" onClick={(e) => e.stopPropagation()}>
           <DropdownMenuItem onSelect={() => void share()}>{t("Share Link")}</DropdownMenuItem>
+          {media && <DropdownMenuItem onSelect={() => setAdding(true)}>{t("Add to Playlist")}</DropdownMenuItem>}
           {target.kind === "pub" && <DropdownMenuItem onSelect={() => setPicking(true)}>{t("More Languages")}</DropdownMenuItem>}
           {target.kind === "pub" && (
             <DropdownMenuItem onSelect={() => void setFavorite(target, !favorite)}>
@@ -198,6 +327,9 @@ export function TileMenu({
         </DropdownMenuContent>
       </DropdownMenu>
       {picking && target.kind === "pub" && <LanguagePicker target={target} onClose={() => setPicking(false)} />}
+      {adding && target.kind === "media" && media && (
+        <AddToPlaylistDialog target={target} media={media} onClose={() => setAdding(false)} />
+      )}
       {confirming && target.kind === "pub" && target.local && (
         <RemoveConfirm
           title={target.title}

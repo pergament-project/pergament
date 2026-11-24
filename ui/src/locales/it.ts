@@ -465,6 +465,9 @@ export const it: Record<string, string> = {
   "Videos, photos and audio": "Video, foto e audio",
   "Skipped unsupported files: {files}": "File non supportati ignorati: {files}",
   "Skipped files: {files}": "File ignorati: {files}",
+  "Add to Playlist": "Aggiungi a playlist",
+  "Search playlists": "Cerca playlist",
+  "Added to {playlist}": "Aggiunto a {playlist}",
 
   // Bible books (New World Translation names)
   "Genesis": "Genesi",

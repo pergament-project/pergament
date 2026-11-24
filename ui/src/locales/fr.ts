@@ -465,6 +465,9 @@ export const fr: Record<string, string> = {
   "Videos, photos and audio": "Vidéos, photos et audio",
   "Skipped unsupported files: {files}": "Fichiers non pris en charge ignorés : {files}",
   "Skipped files: {files}": "Fichiers ignorés : {files}",
+  "Add to Playlist": "Ajouter à une liste de lecture",
+  "Search playlists": "Rechercher des listes de lecture",
+  "Added to {playlist}": "Ajouté à {playlist}",
 
   // Bible books (New World Translation names)
   "Genesis": "Genèse",
