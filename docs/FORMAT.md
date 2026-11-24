@@ -496,6 +496,13 @@ Folder sync merges another computer's file with the same steps, but
 three-way: against the *base*, a snapshot of that computer's file as it was
 at the last merge, kept in the app's data folder. Sync files hold no
 playlist media entries; restore's media copying is not used for them.
+Instead, the media travels through `Pergament-media/` in the sync folder,
+one file per `FilePath`: before writing its own file, a computer copies
+every referenced file it has and the folder lacks there, and after
+merging it copies every referenced file it lacks from there (both through
+`.part` and a rename, never overwriting). Sync never deletes from
+`Pergament-media/`; a file that has not arrived only leaves its item
+unavailable until a later round.
 [own]
 
 - A snapshot holds every highlight (with its ranges), note, user tag,

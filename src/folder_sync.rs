@@ -19,6 +19,9 @@ use crate::userdata::{MergeReport, UserData, backup_identity};
 
 const STATE_FILE: &str = "state.json";
 const BASE_DIR: &str = "base";
+/// Playlist media shared through the sync folder, by `FilePath`. Sync only
+/// adds to it, never deletes.
+pub const SYNC_MEDIA_DIR: &str = "Pergament-media";
 
 /// Write `bytes` to `path` through a temp file in the same directory.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -189,6 +192,12 @@ impl SyncFolder {
                 return Ok(false);
             }
         }
+        // Media first: a peer that merges the new file finds its media
+        // there, and media that could not be copied last time is retried
+        // even when the data is unchanged. Media never holds the data back.
+        if let Err(e) = ud.publish_media(&self.dir.join(SYNC_MEDIA_DIR)) {
+            eprintln!("could not copy playlist media to the sync folder: {e}");
+        }
         let dest = self.dir.join(&self.own);
         let fingerprint = ud.fingerprint()?;
         if state.last_written.as_deref() == Some(fingerprint.as_str()) && dest.is_file() {
@@ -230,6 +239,11 @@ impl SyncFolder {
             if let Some(result) = self.sync_peer(ud, state, choices, &path, &file) {
                 results.push(result);
             }
+        }
+        // Media of merged playlists that has not arrived yet leaves its item
+        // unavailable until a later round finds it.
+        if let Err(e) = ud.fetch_media(&self.dir.join(SYNC_MEDIA_DIR)) {
+            eprintln!("could not copy playlist media from the sync folder: {e}");
         }
         Ok(results)
     }
@@ -413,6 +427,7 @@ pub fn is_device_file(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::playlist::ItemSource;
     use crate::userdata::{BLOCK_VERSE, Loc, Range};
     use std::fs;
 
@@ -535,18 +550,119 @@ mod tests {
         assert_eq!(loaded, a.state);
     }
 
+    /// A playlist "Fotos" on `d` with one photo; returns its `FilePath`.
+    fn add_photo(tmp: &Path, d: &mut Dev) -> String {
+        let tag = d.ud.create_playlist("Fotos").unwrap();
+        let png = tmp.join("IMG_3019.png");
+        fs::write(&png, b"png").unwrap();
+        d.ud.add_file_item(tag, &png).unwrap();
+        match &d.ud.playlist(tag).unwrap().items[0].source {
+            ItemSource::File { path, .. } => {
+                path.file_name().unwrap().to_string_lossy().into_owned()
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn photo_available(d: &Dev) -> bool {
+        let tag = d.ud.playlists().unwrap()[0].id;
+        match &d.ud.playlist(tag).unwrap().items[0].source {
+            ItemSource::File { available, .. } => *available,
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
-    fn own_file_has_no_media() {
+    fn sync_file_has_no_media() {
         let (tmp, mut a, _b) = setup();
         a.mark(1, 1);
-        let tag = a.ud.create_playlist("Fotos").unwrap();
-        let png = tmp.path().join("IMG_3019.png");
-        fs::write(&png, b"png").unwrap();
-        a.ud.add_file_item(tag, &png).unwrap();
+        add_photo(tmp.path(), &mut a);
         assert!(a.write());
         let file = fs::File::open(a.folder.dir.join(&a.folder.own)).unwrap();
         let zip = zip::ZipArchive::new(file).unwrap();
         assert_eq!(zip.len(), 3, "manifest, database and thumbnail only");
+    }
+
+    #[test]
+    fn own_media_published() {
+        let (tmp, mut a, _b) = setup();
+        let name = add_photo(tmp.path(), &mut a);
+        assert!(a.write());
+        let shared = a.folder.dir.join(SYNC_MEDIA_DIR).join(&name);
+        assert_eq!(fs::read(&shared).unwrap(), b"png");
+        let media = a.folder.dir.join(SYNC_MEDIA_DIR);
+        assert_eq!(fs::read_dir(&media).unwrap().count(), 1, "no .part left");
+    }
+
+    #[test]
+    fn peer_media_arrives_later() {
+        let (tmp, mut a, mut b) = setup();
+        let name = add_photo(tmp.path(), &mut a);
+        assert!(a.write());
+        // The data arrives before the media.
+        let shared = a.folder.dir.join(SYNC_MEDIA_DIR).join(&name);
+        let held = tmp.path().join("held");
+        fs::rename(&shared, &held).unwrap();
+        assert_eq!(merged(&b.sync()), 1);
+        assert!(!photo_available(&b));
+        fs::rename(&held, &shared).unwrap();
+        assert!(b.sync().is_empty(), "the peer file is unchanged");
+        assert!(photo_available(&b));
+        assert_eq!(
+            fs::read(b.ud.playlist_media_dir().join(&name)).unwrap(),
+            b"png"
+        );
+    }
+
+    #[test]
+    fn highlight_edit_copies_no_media() {
+        let (tmp, mut a, _b) = setup();
+        let name = add_photo(tmp.path(), &mut a);
+        assert!(a.write());
+        let shared = a.folder.dir.join(SYNC_MEDIA_DIR).join(&name);
+        let mtime = fs::metadata(&shared).unwrap().modified().unwrap();
+        a.mark(1, 1);
+        assert!(a.write(), "the db file is written again");
+        assert_eq!(fs::metadata(&shared).unwrap().modified().unwrap(), mtime);
+        assert_eq!(
+            a.ud.publish_media(&a.folder.dir.join(SYNC_MEDIA_DIR))
+                .unwrap(),
+            0
+        );
+        assert_eq!(fs::metadata(&shared).unwrap().modified().unwrap(), mtime);
+    }
+
+    #[test]
+    fn peers_ignores_media_dir() {
+        let (tmp, mut a, mut b) = setup();
+        add_photo(tmp.path(), &mut a);
+        assert!(a.write());
+        assert!(a.folder.dir.join(SYNC_MEDIA_DIR).is_dir());
+        let peers = b.folder.peers().unwrap();
+        assert_eq!(peers, vec![a.folder.dir.join(&a.folder.own)]);
+        let r = b.sync();
+        assert_eq!(merged(&r), 1, "{r:?}");
+    }
+
+    #[test]
+    fn sync_never_deletes_shared_media() {
+        let (tmp, mut a, mut b) = setup();
+        a.mark(1, 1);
+        let name = add_photo(tmp.path(), &mut a);
+        assert!(a.write());
+        assert_eq!(merged(&b.sync()), 1);
+        let local = b.ud.playlist_media_dir().join(&name);
+        assert!(local.is_file());
+        let tag = a.ud.playlists().unwrap()[0].id;
+        a.ud.delete_playlist(tag).unwrap();
+        assert!(a.write());
+        assert_eq!(merged(&b.sync()), 1);
+        assert!(b.ud.playlists().unwrap().is_empty());
+        assert!(!local.exists(), "the local file goes with its item");
+        let shared = a.folder.dir.join(SYNC_MEDIA_DIR).join(&name);
+        assert!(shared.is_file(), "the shared file stays");
+        assert!(b.write());
+        assert!(shared.is_file());
     }
 
     #[test]

@@ -2011,6 +2011,56 @@ impl UserData {
         Ok(still)
     }
 
+    /// Copy every referenced file present in playlist-media and missing in
+    /// `dir` into `dir` (.part + rename). Returns how many. `dir` is created
+    /// when there is something to copy, its parent is not; files already
+    /// there are left as they are. A file that cannot be copied is logged
+    /// and skipped.
+    pub fn publish_media(&self, dir: &Path) -> Result<usize> {
+        let src = self.playlist_media_dir();
+        let names: Vec<String> = referenced_media(&self.conn)?
+            .into_iter()
+            .filter(|name| src.join(name).is_file() && !dir.join(name).exists())
+            .collect();
+        if names.is_empty() {
+            return Ok(0);
+        }
+        // Only `dir` itself: a missing parent (a sync folder that is not
+        // mounted) is an error, not something to create.
+        match fs::create_dir(dir) {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e.into()),
+            _ => {}
+        }
+        Ok(names
+            .iter()
+            .filter(|name| copy_media_file(&src.join(name), &dir.join(name)))
+            .count())
+    }
+
+    /// Copy every referenced file missing in playlist-media from `dir`, when
+    /// it is there. Returns the names still missing, sorted. Nothing in
+    /// `dir` is changed.
+    pub fn fetch_media(&self, dir: &Path) -> Result<Vec<String>> {
+        let dest = self.playlist_media_dir();
+        let missing: Vec<String> = referenced_media(&self.conn)?
+            .into_iter()
+            .filter(|name| !dest.join(name).is_file())
+            .collect();
+        let mut still = Vec::new();
+        for name in missing {
+            let src = dir.join(&name);
+            let copied = src.is_file()
+                && fs::create_dir_all(&dest)
+                    .inspect_err(|e| eprintln!("could not create {}: {e}", dest.display()))
+                    .is_ok()
+                && copy_media_file(&src, &dest.join(&name));
+            if !copied {
+                still.push(name);
+            }
+        }
+        Ok(still)
+    }
+
     /// Write playlist `id` as a `.jwlplaylist` file to `dest`: a database
     /// with only that playlist, renumbered from 1, and the media files it
     /// uses. Files missing here are left out.
@@ -4476,6 +4526,17 @@ fn write_media_entries(
         io::copy(&mut source, zip)?;
     }
     Ok(())
+}
+
+/// Copy the media file `src` to `dest` through `dest.part` and a rename.
+/// Whether it was copied; a failure is logged. The stored `Hash` is not
+/// checked against the file.
+fn copy_media_file(src: &Path, dest: &Path) -> bool {
+    File::open(src)
+        .map_err(crate::Error::from)
+        .and_then(|mut file| copy_hashed(&mut file, dest))
+        .inspect_err(|e| eprintln!("could not copy playlist media {}: {e}", src.display()))
+        .is_ok()
 }
 
 /// Remove the files `names` from the media directory `dir`, after the rows
