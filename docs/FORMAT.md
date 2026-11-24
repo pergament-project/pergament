@@ -343,10 +343,12 @@ Checked against one backup made by JW Library on iOS (schema version 16,
 - A ZIP with `manifest.json`, `userData.db` and `default_thumbnail.png`.
 - Playlist media: one entry per file a playlist item uses (its media or its
   thumbnail), named by its `IndependentMedia.FilePath` and stored, not
-  deflated. Backups (manual and rolling) and `.jwlplaylist` files written
-  here carry them; a file missing on disk is left out and logged. A restore
-  copies the entries the restored database names into `playlist-media/`
-  after the database is swapped in, then removes the files only the
+  deflated. Pergament keeps these files in `playlist-media/` beside
+  `userData.db`, one file per `FilePath`. Backups (manual and rolling) and
+  `.jwlplaylist` files written here carry them; a file missing on disk is
+  left out and logged. A restore copies the entries the restored database
+  names into `playlist-media/` (at most 4 GiB each, through `.part` and a
+  rename) after the database is swapped in, then removes the files only the
   previous database named; a file that cannot be copied leaves its item
   unavailable. Only names that are safe plain file names are read or
   written. Folder sync files never carry media. [own]
@@ -385,7 +387,7 @@ Checked against one backup made by JW Library on iOS (schema version 16,
 - `Note`: `Guid`, optional `UserMarkId` (the highlight it belongs to),
   `LocationId`, `Title`, `Content` (plain text), `LastModified`, `Created`,
   `BlockType`/`BlockIdentifier` (0 = whole page, else as in `BlockRange`).
-- `Tag` (`Type` 1 = user tag, 0 = favorites) and `TagMap` linking a tag to
+- `Tag` (`Type` 1 = user tag, 0 = favorites, 2 = playlist) and `TagMap` linking a tag to
   a note, a location or a playlist item, with a `Position` per tag.
   Pergament's publication favorites use type-1 locations with no page or
   track details, identified by key symbol, MEPS language and issue tag.
@@ -398,9 +400,48 @@ Checked against one backup made by JW Library on iOS (schema version 16,
   typed into workbook and study article fields: `TextTag` = the `id` of the
   field's `<textarea>` or `<input>`, e.g. `tt47`, not the `id` of its
   `div.gen-field`; a checkbox's `Value` is `1` or `0`, a text line's the text,
-  as in a JW Library backup with checked goals and dates from `lff`),
-  playlists (`Tag` type 2 with `PlaylistItem` rows and their location,
-  media and marker maps) and the `IndependentMedia` files they use.
+  as in a JW Library backup with checked goals and dates from `lff`) and
+  playlists (below).
+- Playlists use JW Library's own tables; Pergament adds none. A playlist
+  is a `Tag` with `Type` 2 and `Name` = the playlist name. Each item is a
+  `PlaylistItem` (`Label`, never empty; `StartTrimOffsetTicks`,
+  `EndTrimOffsetTicks`; `Accuracy`, 1 in the `PlaylistItemAccuracy` table;
+  `EndAction` 0-3; `ThumbnailFilePath`) linked to its playlist by a
+  `TagMap` row with `PlaylistItemId` and a 0-based `Position`, unique per
+  tag. A Library recording is a `PlaylistItemLocationMap` row
+  (`LocationId`, `MajorMultimediaType`, `BaseDurationTicks`) to a
+  `Location` of `Type` 2 (audio) or 3 (video) with `KeySymbol`, `Track`,
+  `IssueTagNumber` and `MepsLanguage`; song 1 of `sjjm` in German is
+  `Type 2, KeySymbol 'sjjm', Track 1, MepsLanguage 2, IssueTagNumber 0`. A
+  file is a `PlaylistItemIndependentMediaMap` row (`IndependentMediaId`,
+  `DurationTicks`) to `IndependentMedia` (`OriginalFilename`, `FilePath`
+  unique, `MimeType`, `Hash`). A thumbnail is an `IndependentMedia` row
+  too, named only by `ThumbnailFilePath`. `PlaylistItemMarker` rows with
+  their `PlaylistItemMarkerBibleVerseMap` and
+  `PlaylistItemMarkerParagraphMap` rows are kept and copied as they are;
+  Pergament does not show or edit them. Times are ticks, 10 000 000 per
+  second.
+- JW Library on iOS writes `Hash` as the SHA-256 with each byte in hex
+  without zero padding (byte `08` becomes `8`, so a hash can be shorter
+  than 64 characters). Pergament writes it the same way and never uses it
+  to check a file. A file added here gets `FilePath` = an uppercase UUID
+  v4, `.` and the lowercase extension (`OriginalFilename` the same),
+  `Label` = the original file name and `MimeType` from the extension
+  (video `mp4 m4v mov`, photo `jpg jpeg png gif webp heic`, audio
+  `mp3 m4a aac wav`). A photo plays for 4 seconds (`DurationTicks`
+  40 000 000). A `FilePath` from a database or zip is used only when it is
+  a plain file name: 1-128 characters, no `/`, `\`, `:` or NUL, not
+  starting with `.`, and none of the zip's fixed entry names. [own]
+- `.jwlplaylist`: one playlist, in the same ZIP layout as a backup, with
+  `manifest.type` 1 and `name` = the file name. Its `userData.db` has the
+  full schema (version 16) and only that playlist (tag id 1), its items,
+  locations, maps, markers and media rows, renumbered from 1; the media
+  files and `default_thumbnail.png` sit next to it. Export sets the
+  database's `LastModified` to now and the manifest `hash` to the SHA-256
+  of the database. Import needs the playlist tables and exactly one
+  type-2 tag; it adds the playlist like a merge adds a missing one (below),
+  named `Name (2)`, `Name (3)`, … when the name is taken, and does not
+  check the manifest hash. [own]
 - Bookmark slots belong to a publication-wide type-1 `Location`, for both
   Bibles and other publications. The target page remains a separate type-0
   location. JW Library databases reject type-0 locations without a document,
@@ -568,6 +609,9 @@ unavailable until a later round.
 - A playlist changed on one side only is taken as it is: the manual
   merge's rule that keeps local file items the incoming version lacks does
   not apply, so an item removed on one computer is removed on the other.
+  A playlist changed on both sides settles by the greater snapshot hash, as
+  above: both computers end with the same version and both report the
+  conflict.
 - The order of a tag's notes is not merged. A `TagMap` row's hash is its
   rank in the tag, but the merge only asks whether the row is there, so
   moving a note within a tag is neither a change nor a conflict, and two

@@ -46,6 +46,9 @@ More in [docs/screenshots](docs/screenshots). All content shown is invented.
   Select a saved bookmark to return to it;
   its menu can replace it with the current location or delete it. Each
   publication and language has its own slots, included in backups and sync.
+- **Playlists:** in Personal Study, recordings from the library and your own
+  videos, photos and audio, played in order. They use JW Library's format,
+  import and export as `.jwlplaylist`, and are included in backups and sync.
 - **Backups:** `.jwlibrary` files, the same format JW Library uses. Restore
   one, or merge it with your data. Pergament also writes a rolling backup to
   the `backups` folder in the library folder when you close it and once a day,
