@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
-import { ListMusic, MoreHorizontal, Pencil, Play, Share2, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useState, useRef } from "react";
+import { ListMusic, MoreHorizontal, Pencil, Play, Share2, Trash2, Upload } from "lucide-react";
 import { AppBar, BarButton, useApp } from "@/app";
-import { api, type Playlist, type PlaylistItemInfo } from "@/lib/api";
+import { api, type Playlist, type PlaylistItemInfo, type AddedFiles } from "@/lib/api";
 import { convertFileSrc } from "@tauri-apps/api/core";
-import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { save as saveDialog, open as openDialog } from "@tauri-apps/plugin-dialog";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -12,6 +12,8 @@ import { formatDuration, type PlayerItem } from "@/lib/player";
 import { useMediaDownloads } from "@/components/media-card";
 import { DeleteConfirm, NameDialog } from "@/components/playlists";
 import { t } from "@/lib/i18n";
+import { isPlaylistFile, makeThumbnail, mediaDuration, ALL_PLAYLIST_EXTENSIONS } from "@/lib/thumbnail";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 
 function isItemAvailable(item: PlaylistItemInfo): boolean {
   if (item.source.type === "file") return item.source.available;
@@ -19,14 +21,21 @@ function isItemAvailable(item: PlaylistItemInfo): boolean {
 }
 
 export function PlaylistView() {
-  const { view, push, toast, playlistsVersion, playlistsChanged, playQueue, showImage } = useApp();
+  const { view, push, replace, toast, playlistsVersion, playlistsChanged, playQueue, showImage } = useApp();
   const playlistId = view.name === "playlist" ? view.id : 0;
   const { list: downloads } = useMediaDownloads();
 
   const [playlist, setPlaylist] = useState<Playlist | null>(null);
+  const playlistRef = useRef<Playlist | null>(null);
   const [renaming, setRenaming] = useState(false);
   const [existingNames, setExistingNames] = useState<string[]>([]);
   const [deleting, setDeleting] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
+
+  // Keep ref in sync with state
+  useEffect(() => {
+    playlistRef.current = playlist;
+  }, [playlist]);
 
   const load = useCallback(async () => {
     if (!playlistId) return;
@@ -34,13 +43,57 @@ export function PlaylistView() {
       const data = await api.playlist(playlistId);
       setPlaylist(data);
     } catch (e) {
+      // Deleted meanwhile, by sync for example: leave instead of showing it stale.
+      if (String(e).startsWith("not found: playlist")) {
+        setPlaylist(null);
+        replace({ name: "personal" });
+        return;
+      }
       toast(String(e));
     }
+    // `replace` is left out on purpose: the app context builds a new one on every change, but it
+    // only wraps a stable `dispatch`. Listing it would reload the playlist on each context change.
   }, [playlistId, toast]);
 
   useEffect(() => {
     void load();
   }, [load, playlistsVersion]);
+
+  // Drag-and-drop event listener. Registering is async, so the view can unmount before the
+  // unlisten function arrives; in that case release it as soon as it does.
+  useEffect(() => {
+    if (!playlistId) return;
+
+    let cancelled = false;
+    let unlisten: (() => void) | null = null;
+
+    const setupDragDrop = async () => {
+      const webview = getCurrentWebview();
+      const release = await webview.onDragDropEvent(async (event) => {
+        if (event.payload.type === "enter") {
+          setDragOver(true);
+        } else if (event.payload.type === "leave") {
+          setDragOver(false);
+        } else if (event.payload.type === "drop") {
+          setDragOver(false);
+          await handleDrop(event.payload.paths);
+        }
+      });
+      if (cancelled) {
+        release();
+      } else {
+        unlisten = release;
+      }
+    };
+
+    setupDragDrop().catch((e) => console.error("playlist drop listener:", e));
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+      unlisten = null;
+    };
+  }, [playlistId, toast, playlistsChanged]);
 
   const availableItems = playlist?.items.filter(isItemAvailable) ?? [];
 
@@ -63,6 +116,100 @@ export function PlaylistView() {
     }
     if (loadedItems.length > 0) {
       playQueue(loadedItems, 0);
+    }
+  };
+
+  const handleDrop = async (paths: string[]) => {
+    const currentPlaylist = playlistRef.current;
+    if (!currentPlaylist) return;
+
+    const supported: string[] = [];
+    const unsupported: string[] = [];
+
+    for (const path of paths) {
+      if (isPlaylistFile(path)) {
+        supported.push(path);
+      } else {
+        unsupported.push(path.split(/[\\/]/).pop() ?? path);
+      }
+    }
+
+    if (unsupported.length > 0) {
+      toast(t("Skipped unsupported files: {files}", { files: unsupported.join(", ") }));
+    }
+
+    if (supported.length === 0) return;
+
+    try {
+      const result: AddedFiles = await api.addFilePlaylistItems(currentPlaylist.id, supported);
+      if (result.skipped.length > 0) {
+        toast(t("Skipped files: {files}", { files: result.skipped.join(", ") }));
+      }
+
+      if (result.added.length > 0) {
+        playlistsChanged();
+        // Reload playlist to get the new items with their IDs
+        const freshPlaylist = await api.playlist(currentPlaylist.id);
+        setPlaylist(freshPlaylist);
+
+        // Process duration and thumbnail for each newly added item
+        const newItems = freshPlaylist.items.filter(
+          (item) => result.added.includes(item.id) && item.source.type === "file"
+        );
+
+        for (const item of newItems) {
+          try {
+            const fileSource = item.source as { type: "file"; path: string; available: boolean };
+            const assetUrl = convertFileSrc(fileSource.path);
+
+            // Get duration for audio/video
+            if (item.kind === "audio" || item.kind === "video") {
+              const duration = await mediaDuration(assetUrl, item.kind);
+              if (duration !== null) {
+                await api.setPlaylistItemDuration(item.id, duration);
+              }
+            }
+
+            // Get thumbnail for image/video
+            if (item.kind === "image" || item.kind === "video") {
+              const thumbnail = await makeThumbnail(assetUrl, item.kind);
+              if (thumbnail) {
+                await api.setPlaylistItemThumbnail(item.id, thumbnail);
+              }
+            }
+          } catch {
+            // Ignore individual errors, continue with next item
+          }
+        }
+
+        playlistsChanged();
+      }
+    } catch (e) {
+      toast(String(e));
+    }
+  };
+
+  const handleFilePicker = async () => {
+    const currentPlaylist = playlistRef.current;
+    if (!currentPlaylist) return;
+
+    try {
+      const paths = await openDialog({
+        multiple: true,
+        filters: [
+          {
+            name: t("Videos, photos and audio"),
+            extensions: [...ALL_PLAYLIST_EXTENSIONS],
+          },
+        ],
+      });
+
+      // The dialog plugin resolves null when the user cancels, so a cancel never reaches the catch.
+      if (paths && paths.length > 0) {
+        await handleDrop(paths);
+      }
+    } catch (e) {
+      toast(String(e));
     }
   };
 
@@ -290,8 +437,33 @@ export function PlaylistView() {
           </table>
         )}
 
-        {/* Task 13: Import File drop zone slot */}
-        <div id="playlist-drop-zone-slot" />
+        <div
+          id="playlist-drop-zone-slot"
+          className={cn(
+            "relative border-2 border-dashed rounded-lg p-8 text-center transition-colors",
+            dragOver
+              ? "border-accent bg-accent/10"
+              : "border-line hover:border-muted-foreground/50 hover:bg-muted/30"
+          )}
+          onClick={handleFilePicker}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              handleFilePicker();
+            }
+          }}
+        >
+          <Upload className="mx-auto mb-3 size-12 text-muted-foreground" strokeWidth={1.5} />
+          <p className="text-lg font-medium">{t("Import File")}</p>
+          <p className="text-sm text-muted-foreground mt-1">
+            {t("Videos, photos and audio")}
+          </p>
+          <p className="text-xs text-muted-foreground mt-2">
+            {t("Drop files here or click to import")}
+          </p>
+        </div>
       </div>
 
       <NameDialog

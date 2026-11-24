@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 const calls: { cmd: string; args: unknown }[] = [];
+// When set, the `playlist` command fails with this error.
+let playlistError: string | null = null;
 let playlists: { id: number; name: string; items: number; durationTicks: number; thumbnail: string | null }[] = [];
 let playlistItems: {
   id: number;
@@ -23,6 +25,7 @@ vi.mock("@tauri-apps/api/core", () => ({
     calls.push({ cmd, args });
     if (cmd === "playlists") return playlists;
     if (cmd === "playlist") {
+      if (playlistError) throw playlistError;
       const id = (args as { id: number }).id;
       return { id, name: playlists.find((p) => p.id === id)?.name ?? "", items: playlistItems };
     }
@@ -33,19 +36,30 @@ vi.mock("@tauri-apps/api/core", () => ({
     if (cmd === "move_playlist_item") return undefined;
     if (cmd === "import_playlist") return 2;
     if (cmd === "export_playlist") return undefined;
+    if (cmd === "add_file_playlist_items") {
+      const { paths } = args as { paths: string[] };
+      // Return added IDs (simulate new items with IDs 100, 101, etc.)
+      const added = paths.map((_, i) => 100 + i);
+      return { added, skipped: [] };
+    }
+    if (cmd === "set_playlist_item_duration") return undefined;
+    if (cmd === "set_playlist_item_thumbnail") return undefined;
     return undefined;
   }),
   convertFileSrc: (p: string) => p,
 }));
 
 const push = vi.fn();
+const replace = vi.fn();
 const toast = vi.fn();
 const playQueue = vi.fn();
 const showImage = vi.fn();
 let userVersion = 0;
 let notesVersion = 0;
 let playlistsVersion = 0;
-const playlistsChanged = vi.fn();
+const playlistsChanged = vi.fn(() => {
+  playlistsVersion++;
+});
 let currentView: { name: string; id?: number } = { name: "personal" };
 
 vi.mock("@/app", () => ({
@@ -72,7 +86,7 @@ vi.mock("@/app", () => ({
     releaseNote: vi.fn(),
     keepNote: vi.fn(),
     view: currentView,
-    replace: vi.fn(),
+    replace,
     favorites: [],
     catalogVersion: 0,
     loadCatalog: vi.fn(),
@@ -125,6 +139,36 @@ vi.mock("@/lib/playlist", () => ({
   }),
 }));
 
+// Mock storage for webview
+let mockOnDragDropEvent = vi.fn();
+let mockUnlisten = vi.fn();
+// When set, onDragDropEvent returns this promise instead of resolving at once (to test early unmount).
+let pendingDragDropRegistration: Promise<() => void> | null = null;
+
+vi.mock("@tauri-apps/api/webview", () => ({
+  getCurrentWebview: () => ({
+    onDragDropEvent: (...args: unknown[]) => {
+      mockOnDragDropEvent(...args);
+      return pendingDragDropRegistration ?? Promise.resolve(mockUnlisten);
+    },
+  }),
+}));
+
+// Mock storage for thumbnail
+let mockMakeThumbnail = vi.fn(async (_url: string, _kind: "image" | "video") => new Uint8Array([1, 2, 3]));
+let mockMediaDuration = vi.fn(async (_url: string, _kind: "audio" | "video") => 120);
+let mockIsPlaylistFile = vi.fn((path: string) => {
+  const ext = path.toLowerCase().split(".").pop() ?? "";
+  return ["mp4", "m4v", "mov", "jpg", "jpeg", "png", "gif", "webp", "heic", "mp3", "m4a", "aac", "wav"].includes(ext);
+});
+
+vi.mock("@/lib/thumbnail", () => ({
+  isPlaylistFile: (path: string) => mockIsPlaylistFile(path),
+  makeThumbnail: (url: string, kind: "image" | "video") => mockMakeThumbnail(url, kind),
+  mediaDuration: (url: string, kind: "audio" | "video") => mockMediaDuration(url, kind),
+  ALL_PLAYLIST_EXTENSIONS: ["mp4", "m4v", "mov", "jpg", "jpeg", "png", "gif", "webp", "heic", "mp3", "m4a", "aac", "wav"],
+}));
+
 import { PlaylistsSection } from "./playlists";
 import { PlaylistView } from "@/views/playlist";
 
@@ -132,6 +176,8 @@ const sent = (cmd: string) => calls.filter((c) => c.cmd === cmd).map((c) => c.ar
 
 beforeEach(async () => {
   calls.length = 0;
+  playlistError = null;
+  pendingDragDropRegistration = null;
   playlists = [
     { id: 1, name: "Songs", items: 3, durationTicks: 300_000_000, thumbnail: null },
     { id: 2, name: "Videos", items: 2, durationTicks: 200_000_000, thumbnail: null },
@@ -177,6 +223,7 @@ beforeEach(async () => {
   currentView = { name: "personal" };
   playlistsChanged.mockClear();
   push.mockClear();
+  replace.mockClear();
   toast.mockClear();
   playQueue.mockClear();
   showImage.mockClear();
@@ -411,5 +458,147 @@ describe("PlaylistView", () => {
         { id: 1, path: "/tmp/exported.jwlplaylist" },
       ]),
     );
+  });
+
+  it("drag drop: drop event with supported and unsupported files calls add_file_playlist_items with supported only and toasts skipped", async () => {
+    // Reset mocks
+    mockOnDragDropEvent.mockClear();
+    mockUnlisten.mockClear();
+    mockUnlisten.mockResolvedValue(undefined);
+    calls.length = 0;
+
+    // Setup playlist with existing items BEFORE rendering
+    playlistItems = [
+      {
+        id: 10,
+        label: "Song 1",
+        kind: "audio",
+        durationTicks: 100_000_000,
+        startTrimTicks: null,
+        endTrimTicks: null,
+        endAction: 0,
+        thumbnail: null,
+        source: { type: "library", keySymbol: "sjjm", track: 1, issueTag: 0, mepsLanguage: 2, kind: "audio", langCode: "de" },
+      },
+    ];
+
+    // Re-render to pick up the new playlistItems
+    const { unmount } = render(<PlaylistView />);
+    expect(await screen.findByText("Song 1")).toBeTruthy();
+
+    // Get the registered drag-drop handler
+    await waitFor(() => expect(mockOnDragDropEvent).toHaveBeenCalled());
+    const handler = mockOnDragDropEvent.mock.calls[0][0];
+    console.log("Handler obtained:", typeof handler);
+
+    // Simulate drop event with mixed files (event has payload property)
+    console.log("Calling handler...");
+    await handler({ payload: { type: "drop", paths: ["/path/a.mp4", "/path/b.txt", "/path/c.jpg"] } });
+    console.log("Handler returned");
+
+    // Wait a bit for async operations
+    await new Promise((r) => setTimeout(r, 100));
+
+    // Check all calls
+    console.log("All calls:", JSON.stringify(calls, null, 2));
+
+    // Should call add_file_playlist_items with only supported files
+    await waitFor(() =>
+      expect(sent("add_file_playlist_items")).toEqual([
+        { playlist: 1, paths: ["/path/a.mp4", "/path/c.jpg"] },
+      ]),
+    );
+
+    // Should toast skipped files
+    expect(toast).toHaveBeenCalledWith(expect.stringContaining("b.txt"));
+
+    unmount();
+  });
+
+  it("drag drop: unmount calls unlisten function", async () => {
+    // Reset mocks
+    mockOnDragDropEvent.mockClear();
+    mockUnlisten.mockClear();
+    mockUnlisten.mockResolvedValue(undefined);
+
+    const { unmount } = render(<PlaylistView />);
+    expect(await screen.findByText("Song 1")).toBeTruthy();
+
+    // Wait for drag-drop to be set up
+    await waitFor(() => expect(mockOnDragDropEvent).toHaveBeenCalled());
+
+    // Unmount the component
+    unmount();
+
+    // Should have called the unlisten function
+    expect(mockUnlisten).toHaveBeenCalled();
+  });
+
+  it("drag drop: unmount before the listener registers still calls unlisten", async () => {
+    mockOnDragDropEvent.mockClear();
+    mockUnlisten.mockClear();
+    let finishRegistration: (unlisten: () => void) => void = () => {};
+    pendingDragDropRegistration = new Promise((resolve) => {
+      finishRegistration = resolve;
+    });
+
+    try {
+      const { unmount } = render(<PlaylistView />);
+      await waitFor(() => expect(mockOnDragDropEvent).toHaveBeenCalled());
+
+      unmount();
+      expect(mockUnlisten).not.toHaveBeenCalled();
+
+      finishRegistration(mockUnlisten);
+      await waitFor(() => expect(mockUnlisten).toHaveBeenCalledTimes(1));
+    } finally {
+      pendingDragDropRegistration = null;
+    }
+  });
+
+  it("drag drop: skipped Windows paths show only the file name", async () => {
+    mockOnDragDropEvent.mockClear();
+
+    render(<PlaylistView />);
+    expect(await screen.findByText("Song 1")).toBeTruthy();
+    await waitFor(() => expect(mockOnDragDropEvent).toHaveBeenCalled());
+    const handler = mockOnDragDropEvent.mock.calls[0][0];
+
+    await handler({ payload: { type: "drop", paths: ["C:\\Users\\me\\notes.txt"] } });
+
+    expect(toast).toHaveBeenCalledWith(expect.stringContaining("notes.txt"));
+    expect(toast).not.toHaveBeenCalledWith(expect.stringContaining("Users"));
+  });
+
+  it("leaves a playlist that sync deleted", async () => {
+    const { rerender } = render(<PlaylistView />);
+    expect(await screen.findByText("Song 1")).toBeTruthy();
+    playlistError = "not found: playlist 1";
+    playlistsVersion++;
+    rerender(<PlaylistView />);
+    await waitFor(() => expect(replace).toHaveBeenCalledWith({ name: "personal" }));
+    expect(screen.queryByText("Song 1")).toBeNull();
+    expect(toast).not.toHaveBeenCalled();
+  });
+
+  it("stays on other load errors", async () => {
+    playlistError = "database is locked";
+    render(<PlaylistView />);
+    await waitFor(() => expect(toast).toHaveBeenCalledWith("database is locked"));
+    expect(replace).not.toHaveBeenCalled();
+  });
+
+  it("logs a failed drop listener", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    let fail: (e: Error) => void = () => {};
+    pendingDragDropRegistration = new Promise((_, reject) => {
+      fail = reject;
+    });
+    render(<PlaylistView />);
+    expect(await screen.findByText("Song 1")).toBeTruthy();
+    await waitFor(() => expect(mockOnDragDropEvent).toHaveBeenCalled());
+    fail(new Error("no webview"));
+    await waitFor(() => expect(error).toHaveBeenCalledWith(expect.stringContaining("drop"), expect.any(Error)));
+    error.mockRestore();
   });
 });

@@ -484,6 +484,10 @@ export const ptBR: Record<string, string> = {
   "Play all": "Reproduzir tudo",
   "Add items to listen to or to watch": "Adicionar itens para ouvir ou assistir",
   "Drop files here or click to import": "Arraste arquivos aqui ou clique para importar",
+  "Import File": "Importar arquivo",
+  "Videos, photos and audio": "Vídeos, fotos e áudio",
+  "Skipped unsupported files: {files}": "Arquivos não suportados ignorados: {files}",
+  "Skipped files: {files}": "Arquivos ignorados: {files}",
 
   // Bible books (New World Translation names)
   "Genesis": "Gênesis",
