@@ -15,31 +15,13 @@
   ],
   "modules": [
     {
-      "name": "gst-plugin-tauri",
-      "buildsystem": "simple",
-      "build-options": {
-        "build-args": ["--share=network"]
-      },
-      "sources": [
-        {
-          "type": "git",
-          "url": "https://github.com/tauri-apps/tauri-gstreamer-plugin",
-          "tag": "gst-plugin-tauri-v0.0.1"
-        }
-      ],
-      "build-commands": [
-        "cargo build --release --target=x86_64-unknown-linux-gnu",
-        "mkdir -p /app/lib/gstreamer-1.0",
-        "cp target/x86_64-unknown-linux-gnu/release/libgsttauriasset.so /app/lib/gstreamer-1.0/"
-      ]
-    },
-    {
       "name": "pergament",
       "buildsystem": "simple",
       "sources": [{ "type": "dir", "path": "../../target/flatpak" }],
       "build-commands": [
         "install -Dm755 bin/pergament-app /app/bin/pergament-app",
         "install -Dm755 bin/pergament /app/bin/pergament",
+        "install -Dm755 lib/gstreamer-1.0/libgsttauriasset.so /app/lib/gstreamer-1.0/libgsttauriasset.so",
         "install -Dm644 share/applications/io.github.v3rm1n.pergament.desktop /app/share/applications/io.github.v3rm1n.pergament.desktop",
         "install -Dm644 share/metainfo/io.github.v3rm1n.pergament.metainfo.xml /app/share/metainfo/io.github.v3rm1n.pergament.metainfo.xml",
         "for size in 32x32 64x64 128x128 256x256 512x512; do install -Dm644 share/icons/hicolor/$size/apps/io.github.v3rm1n.pergament.png /app/share/icons/hicolor/$size/apps/io.github.v3rm1n.pergament.png; done",

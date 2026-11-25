@@ -4,7 +4,7 @@
 # The manifest only stages the built files into /app, so no compilers are needed
 # inside the sandbox. Build first:
 #   bun run build
-#   cargo build --release -p pergament -p pergament-app --features pergament-app/custom-protocol
+#   cargo build --release -p pergament -p pergament-app -p gst-plugin-tauri --features pergament-app/custom-protocol,pergament-app/gst-plugin
 # The GNOME runtime and SDK versions pinned in the manifest must be installed:
 #   flatpak --user install flathub org.gnome.Platform//<pin> org.gnome.Sdk//<pin>
 set -euo pipefail
@@ -17,7 +17,7 @@ scripts/versions.sh "$version" >/dev/null
 app_id=io.github.v3rm1n.pergament
 manifest=packaging/flatpak/$app_id.json
 [[ -f $manifest ]] || die "$manifest is missing"
-for f in target/release/pergament target/release/pergament-app; do
+for f in target/release/pergament target/release/pergament-app target/release/libgsttauriasset.so; do
     [[ -x $f ]] || die "$f is missing; build the release first"
 done
 
@@ -26,6 +26,7 @@ rm -rf "$stage" target/flatpak-build target/flatpak-repo
 mkdir -p "$stage/bin" "$stage/share/applications" "$stage/share/metainfo" \
     "$stage/share/icons/hicolor/scalable/apps"
 install -m755 target/release/pergament target/release/pergament-app "$stage/bin/"
+install -Dm755 target/release/libgsttauriasset.so "$stage/lib/gstreamer-1.0/libgsttauriasset.so"
 for size in 32 64 128 256; do
     mkdir -p "$stage/share/icons/hicolor/${size}x${size}/apps"
     install -m644 "src-tauri/icons/${size}x${size}.png" \
