@@ -68,7 +68,12 @@
           pname = "pergament";
           version = buildVersion;
           inherit src;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "gst-plugin-tauri-0.0.1" = "sha256-bn2CnMRIjgLytO0bHMoKnU/gnqfF8ye8fZPrRHibjwE=";
+            };
+          };
 
           # React frontend, built into dist/ and embedded into pergament-app.
           # node_modules is fetched in a fixed-output derivation from bun.lock.
