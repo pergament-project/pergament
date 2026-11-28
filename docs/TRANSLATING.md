@@ -1,6 +1,6 @@
 # Translating Pergament
 
-The interface is available in English, German, Portuguese (Brazil), French and Italian.
+The interface is available in English, German, Portuguese (Brazil), French, Italian and Spanish.
 Adding another language is one new file and one line in a list. You do not need
 to know TypeScript; the file is a list of English texts with room for yours
 next to them.
